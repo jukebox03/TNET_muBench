@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mubench-dpu
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s0-dpu
+  namespace: mubench-dpu
+  labels:
+    app: s0-dpu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s0-dpu
+  template:
+    metadata:
+      labels:
+        app: s0-dpu
+    spec:
+      containers:
+      - name: s0-dpu
+        image: mubench-dpu:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080  # Web Server (Metrics etc)
+        - containerPort: 5005  # DPU Simulation Bridge
+        env:
+        - name: APP
+          value: "s0"
+        - name: ZONE
+          value: "us-west-1"
+        - name: K8S_APP
+          value: "mubench-app"

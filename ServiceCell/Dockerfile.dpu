@@ -1,0 +1,32 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# 1. Install dependencies
+COPY ServiceCell/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install requests flask prometheus_client grpcio protobuf gunicorn
+
+# 2. Copy Source Code
+COPY ServiceCell/ /app/
+
+# 3. Setup Configs & Functions
+RUN mkdir -p MSConfig/InternalServiceFunctions
+COPY workmodel-fixed.json MSConfig/workmodel.json
+COPY CustomFunctions/ /app/MSConfig/InternalServiceFunctions/
+
+# 4. Preparation
+RUN cp CellController-mp_dpu.py CellController_mp_dpu.py
+
+# 5. Environment
+ENV APP=s0
+ENV ZONE=us-west-1
+ENV K8S_APP=mubench-app
+ENV PN=1
+ENV TN=1
+ENV PYTHONUNBUFFERED=1
+ENV prometheus_multiproc_dir=/app/metrics_tmp
+RUN mkdir -p /app/metrics_tmp
+
+# 6. Run Command (Using launcher to avoid module duplication)
+CMD ["python", "launcher.py"]
