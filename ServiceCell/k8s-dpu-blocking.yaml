@@ -38,4 +38,27 @@ spec:
         - name: PN
           value: "1"
         - name: TN
-          value: "50"
+          value: "4"
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: s0-dpu-blocking-svc
+  namespace: mubench-blocking
+spec:
+  selector:
+    app: s0-dpu-blocking
+  type: NodePort
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30081  # Port 30081 for HTTP to avoid conflict with standard DPU
+    - name: dpu-bridge
+      protocol: TCP
+      port: 5005
+      targetPort: 5005
+      nodePort: 30006  # Port 30006 for DPU Bridge to avoid conflict with standard DPU

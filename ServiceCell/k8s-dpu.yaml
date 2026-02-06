@@ -24,6 +24,7 @@ spec:
       - name: s0-dpu
         image: mubench-dpu:latest
         imagePullPolicy: Never
+        command: ["python", "CellController-mp_dpu.py"]
         ports:
         - containerPort: 8080  # Web Server (Metrics etc)
         - containerPort: 5005  # DPU Simulation Bridge
@@ -34,3 +35,27 @@ spec:
           value: "us-west-1"
         - name: K8S_APP
           value: "mubench-app"
+        - name: PN
+          value: "4"  # Default: 4 Worker Processes (Async)
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: s0-dpu-svc
+  namespace: mubench-dpu
+spec:
+  selector:
+    app: s0-dpu
+  type: NodePort
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080  # 외부에서 30080으로 접속 시 8080으로 연결
+    - name: dpu-bridge
+      protocol: TCP
+      port: 5005
+      targetPort: 5005
+      nodePort: 30005  # 외부에서 30005로 접속 시 5005로 연결

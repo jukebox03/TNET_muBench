@@ -12,12 +12,7 @@ import json
 import os
 from typing import Optional, Dict
 from dataclasses import dataclass, field
-
-# Dynamic Import based on Mode
-if os.environ.get('DPUMESH_MP_MODE') == '1':
-    from . import dpu_lib_mp as dpu_lib
-else:
-    from . import dpu_lib
+from . import dpu_lib
 
 
 @dataclass

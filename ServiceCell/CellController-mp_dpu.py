@@ -131,15 +131,36 @@ def start_worker():
                 jaeger_headers[jhdr] = val
 
         # if POST check the presence of a trace
-        trace=dict()
+        trace = {}
         if request.method == 'POST':
-            trace = request.json
+            try:
+                # Debug: Print raw data if needed
+                raw_data = request.get_data()
+                if not raw_data:
+                     app.logger.warning("Empty raw body in POST")
+                
+                trace = request.get_json(force=True, silent=True)
+                if trace is None:
+                    app.logger.warning(f"Failed to parse JSON. Raw body: {raw_data.decode('utf-8', errors='ignore')[:200]}")
+                    trace = {}
+            except Exception as e:
+                app.logger.error(f"JSON Parsing Error: {e}")
+                trace = {}
+
+        if trace and len(trace) > 0:
             # sanity_check
-            assert len(trace.keys())==1, 'bad trace format'
-            assert ID == list(trace)[0].split(traceEscapeString)[0], "bad trace format, ID"
-            trace[ID] = trace[list(trace)[0]] # We insert 1 more key "s0": [value] 
+            if len(trace.keys()) != 1:
+                app.logger.error(f"Bad trace format: keys={list(trace.keys())}")
+                return make_response(json.dumps({"message": "bad trace format"}), 400)
             
-        if len(trace)>0:
+            trace_key = list(trace.keys())[0]
+            if ID != trace_key.split(traceEscapeString)[0]:
+                app.logger.error(f"Bad trace format: ID mismatch {ID} vs {trace_key}")
+                # Optional: return 400 or just continue
+            
+            trace[ID] = trace[trace_key]
+            
+        if trace and ID in trace and len(trace[ID]) > 0:
         # trace-driven request
             n_groups = len(trace[ID])
             my_service_graph = list()
@@ -214,13 +235,16 @@ if __name__ == '__main__':
     if request_method == "rest":
         init_REST(app)
         
-        # ===== CHANGED: Use dpumesh-server instead of Gunicorn =====
-        from dpumesh.server import DPUmeshServer, set_server
+        # ===== CHANGED: Use ProcessGraphServer for Multi-Process Non-Blocking =====
+        from dpumesh.server import ProcessGraphServer
         
-        server = DPUmeshServer(app, host='0.0.0.0', port=8080)
-        set_server(server)  # ← CRITICAL: register server for requests.submit()
+        # Use 'PN' (Process Number) from environment, default to 4 if not set
+        num_workers = int(PN) if PN else 4
+        
+        # Pass app path string so workers can load it fresh
+        server = ProcessGraphServer("CellController-mp_dpu:app", host='0.0.0.0', port=8080, workers=num_workers)
         server.run()
-        # ==========================================================
+        # =========================================================================
         
     elif request_method == "grpc":
         # gRPC not yet supported in DPU mode

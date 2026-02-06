@@ -1,71 +1,75 @@
 """
-dpu_lib v2 - Hardware Abstraction Layer (Simulation Mode with TCP Bridge)
+dpu_lib v3 - Unified Multi-Process Hardware Abstraction Layer
 
-Updated architecture based on DPU sidecar design:
-- Separated metadata (SQ/CQ) and data (Buffer Pool)
-- DMA Manager as explicit component for Host ↔ DPU transfers
-- Interrupt + busy polling hybrid notification mechanism
+This library now supports both Single-Process (Threaded) and Multi-Process (MP) modes transparently.
+It simulates the DPU hardware in the Main Process, while allowing multiple Worker Processes
+to submit requests and receive responses via dedicated IPC queues.
 
 Architecture:
-  Host Side:    Host SQ, Host CQ, Host Buffer Pool
-  DPA:          DMA Manager (polls Host SQ / Sidecar SQ, transfers data)
-  DPU Side:     Sidecar CQ, Sidecar SQ, Sidecar Buffer Pool, L7 Proxy
+  [Worker Process N]      [Main Process / DPU Simulation]
+      |                       |
+      | register_worker(N) -> | Creates Queue[N]
+      |                       |
+      | submit_egress() ----> | _egress_req_q (Global)
+      |                       |       |
+      |                       |   [Egress Dispatcher] -> Host SQ -> DMA -> Proxy
+      |                       |                                        |
+      |                       |   [Egress Collector]  <- Host CQ <- DMA <- Proxy
+      |                       |       |
+      | <---- Queue[N] <----- | (Routes response to correct Worker Queue)
+      |                       |
+
 """
 
 import threading
+import multiprocessing
 import socket
 import json
 import time
+import os
+import uuid
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from queue import Queue, Empty
 from enum import Enum
 
 
-# ===== Data Structures =====
+# ========================================================================================
+# 1. SHARED DATA STRUCTURES (Metadata)
+# ========================================================================================
 
 class OpType(Enum):
-    """Operation types for SQ/CQ entries"""
     REQUEST = 1
     RESPONSE = 2
 
-
 @dataclass
 class SQEntry:
-    """Submission Queue Entry - metadata only (lightweight)"""
-    req_id: int
-    data_id: int          # Reference to Buffer Pool entry
+    req_id: str  # Changed to string to support UUIDs
+    data_id: int
     op_type: OpType
-    # Additional metadata for routing
     method: str = ""
     path: str = ""
-    url: str = ""         # For egress requests
-
+    url: str = ""
 
 @dataclass
 class CQEntry:
-    """Completion Queue Entry - metadata only"""
-    req_id: int
+    req_id: str
     data_id: int
     op_type: OpType
     status_code: int = 200
 
-
 @dataclass
 class BufferEntry:
-    """Buffer Pool Entry - actual request/response data"""
     data_id: int
     headers: Dict[str, str]
     body: Optional[str]
     query_string: str = ""
     remote_addr: str = ""
 
-
-# ===== Legacy-compatible dataclasses (for server.py/requests.py interface) =====
-
+# Legacy-compatible dataclasses
 @dataclass
 class IngressRequest:
-    req_id: int
+    req_id: str
     method: str
     path: str
     headers: Dict[str, str]
@@ -73,622 +77,436 @@ class IngressRequest:
     query_string: str
     remote_addr: str
 
-
 @dataclass
 class IngressResponse:
-    req_id: int
+    req_id: str
     status_code: int
     headers: Dict[str, str]
     body: str
-
-
-@dataclass
-class EgressRequest:
-    req_id: int
-    method: str
-    url: str
-    headers: Dict[str, str]
-    body: Optional[str]
-
 
 @dataclass
 class EgressResponse:
-    req_id: int
+    req_id: str
     status_code: int
     headers: Dict[str, str]
     body: str
 
 
-# ===== Interrupt Mechanism =====
+# ========================================================================================
+# 2. INTERNAL COMPONENTS (Run in Main Process / DPU Side)
+# ========================================================================================
 
 class InterruptController:
-    """
-    Simulates hardware interrupt + busy polling hybrid.
-    
-    In real DPU HW:
-    - DMA completion triggers PCIe MSI-X interrupt
-    - Target (App or Proxy) wakes from sleep/halt
-    - Then busy-polls CQ for entries
-    
-    Simulation:
-    - Uses threading.Event as interrupt line
-    - wait_interrupt() blocks until signaled or timeout
-    """
-    
+    """Simulates hardware interrupt (Threading based, used inside DPU simulation)"""
     def __init__(self, name: str):
-        self.name = name
         self._event = threading.Event()
-    
-    def signal(self):
-        """Raise interrupt (DMA transfer complete)"""
-        self._event.set()
-    
+    def signal(self): self._event.set()
     def wait(self, timeout: float = 0.01) -> bool:
-        """Wait for interrupt, returns True if signaled"""
-        triggered = self._event.wait(timeout=timeout)
+        ret = self._event.wait(timeout=timeout)
         self._event.clear()
-        return triggered
-    
-    def poll(self) -> bool:
-        """Non-blocking check (busy polling)"""
-        if self._event.is_set():
-            self._event.clear()
-            return True
-        return False
-
-
-# ===== Buffer Pool =====
+        return ret
 
 class BufferPool:
-    """
-    Shared memory buffer pool (simulated).
-    
-    In real HW: pinned DMA-capable memory region.
-    Simulation: thread-safe dictionary.
-    """
-    
+    """Shared memory buffer pool (Thread-safe dict)"""
     def __init__(self, name: str):
         self.name = name
         self._buffers: Dict[int, BufferEntry] = {}
         self._lock = threading.Lock()
-    
     def write(self, entry: BufferEntry):
-        with self._lock:
-            self._buffers[entry.data_id] = entry
-    
+        with self._lock: self._buffers[entry.data_id] = entry
     def read(self, data_id: int) -> Optional[BufferEntry]:
-        with self._lock:
-            return self._buffers.get(data_id)
-    
+        with self._lock: return self._buffers.get(data_id)
     def remove(self, data_id: int):
-        with self._lock:
-            self._buffers.pop(data_id, None)
-
-
-# ===== DMA Manager =====
+        with self._lock: self._buffers.pop(data_id, None)
 
 class DMAManager:
-    """
-    Simulates DPA (Data Path Accelerator) DMA Manager.
-    
-    Runs as separate thread, continuously polls:
-    1. Host SQ → transfers data to Sidecar Buffer Pool → writes Sidecar CQ → interrupts Proxy
-    2. Sidecar SQ → transfers data to Host Buffer Pool → writes Host CQ → interrupts App
-    """
-    
-    def __init__(self,
-                 host_sq: Queue, host_cq: Queue,
-                 host_bp: BufferPool,
-                 sidecar_cq: Queue, sidecar_sq: Queue,
-                 sidecar_bp: BufferPool,
-                 proxy_interrupt: InterruptController,
-                 app_interrupt: InterruptController):
-        
-        self._host_sq = host_sq
-        self._host_cq = host_cq
-        self._host_bp = host_bp
-        self._sidecar_cq = sidecar_cq
-        self._sidecar_sq = sidecar_sq
-        self._sidecar_bp = sidecar_bp
-        self._proxy_interrupt = proxy_interrupt
-        self._app_interrupt = app_interrupt
-        
-        self._running = False
-        self._thread = None
-    
-    def start(self):
+    """Transfers data between Host BP and Sidecar BP"""
+    def __init__(self, host_sq, host_cq, host_bp, sidecar_cq, sidecar_sq, sidecar_bp, proxy_int, app_int):
+        self.host_sq = host_sq
+        self.host_cq = host_cq
+        self.host_bp = host_bp
+        self.sidecar_cq = sidecar_cq
+        self.sidecar_sq = sidecar_sq
+        self.sidecar_bp = sidecar_bp
+        self.proxy_int = proxy_int
+        self.app_int = app_int
         self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="DMA-Manager")
-        self._thread.start()
-    
+        threading.Thread(target=self._run, daemon=True, name="DMA-Manager").start()
+
     def _run(self):
-        """DMA Manager main loop - polls both directions"""
-        # print("[DMA] DMA Manager started", flush=True)
-        
         while self._running:
-            work_done = False
-            
-            # === Host → DPU (Outbound requests) ===
+            work = False
+            # Host -> Sidecar
             try:
-                sq_entry = self._host_sq.get_nowait()
-                work_done = True
-                self._transfer_host_to_sidecar(sq_entry)
-            except Empty:
-                pass
+                e = self.host_sq.get_nowait()
+                self._transfer_h2s(e)
+                work = True
+            except Empty: pass
             
-            # === DPU → Host (Inbound responses) ===
+            # Sidecar -> Host
             try:
-                sq_entry = self._sidecar_sq.get_nowait()
-                work_done = True
-                self._transfer_sidecar_to_host(sq_entry)
-            except Empty:
-                pass
+                e = self.sidecar_sq.get_nowait()
+                self._transfer_s2h(e)
+                work = True
+            except Empty: pass
             
-            if not work_done:
-                time.sleep(0.0001)  # Avoid busy-wait in simulation
-    
-    def _transfer_host_to_sidecar(self, sq_entry: SQEntry):
-        """
-        DMA transfer: Host → Sidecar
-        1. Read request data from Host Buffer Pool
-        2. Write to Sidecar Buffer Pool
-        3. Write CQ entry to Sidecar CQ
-        4. Interrupt Proxy
-        """
-        # DMA Read from Host Buffer Pool
-        buf = self._host_bp.read(sq_entry.data_id)
-        if buf is None:
-            # print(f"[DMA] Warning: no buffer for data_id {sq_entry.data_id}", flush=True)
-            return
-        
-        # DMA Write to Sidecar Buffer Pool (simulate copy)
-        sidecar_buf = BufferEntry(
-            data_id=sq_entry.data_id,
-            headers=buf.headers.copy(),
-            body=buf.body,
-            query_string=buf.query_string,
-            remote_addr=buf.remote_addr
-        )
-        self._sidecar_bp.write(sidecar_buf)
-        
-        # Write metadata to Sidecar CQ
-        cq_entry = CQEntry(
-            req_id=sq_entry.req_id,
-            data_id=sq_entry.data_id,
-            op_type=sq_entry.op_type
-        )
-        self._sidecar_cq.put(cq_entry)
-        
-        # Interrupt Proxy: "new request ready"
-        self._proxy_interrupt.signal()
-        
-        # Cleanup Host Buffer (data transferred)
-        self._host_bp.remove(sq_entry.data_id)
-    
-    def _transfer_sidecar_to_host(self, sq_entry: SQEntry):
-        """
-        DMA transfer: Sidecar → Host
-        1. Read response data from Sidecar Buffer Pool
-        2. Write to Host Buffer Pool
-        3. Write CQ entry to Host CQ
-        4. Interrupt App
-        """
-        # DMA Read from Sidecar Buffer Pool
-        buf = self._sidecar_bp.read(sq_entry.data_id)
-        if buf is None:
-            return
-        
-        # DMA Write to Host Buffer Pool
-        host_buf = BufferEntry(
-            data_id=sq_entry.data_id,
-            headers=buf.headers.copy(),
-            body=buf.body,
-            query_string=buf.query_string,
-            remote_addr=buf.remote_addr
-        )
-        self._host_bp.write(host_buf)
-        
-        # Write metadata to Host CQ
-        cq_entry = CQEntry(
-            req_id=sq_entry.req_id,
-            data_id=sq_entry.data_id,
-            op_type=sq_entry.op_type,
-            status_code=sq_entry.req_id  # Will be overwritten
-        )
-        self._host_cq.put(cq_entry)
-        
-        # Interrupt App: "response ready"
-        self._app_interrupt.signal()
-        
-        # Cleanup Sidecar Buffer
-        self._sidecar_bp.remove(sq_entry.data_id)
-    
-    def stop(self):
-        self._running = False
+            if not work: time.sleep(0.0001)
+
+    def _transfer_h2s(self, sq: SQEntry):
+        buf = self.host_bp.read(sq.data_id)
+        if not buf: return
+        self.sidecar_bp.write(BufferEntry(sq.data_id, buf.headers, buf.body, buf.query_string, buf.remote_addr))
+        self.sidecar_cq.put(CQEntry(sq.req_id, sq.data_id, sq.op_type))
+        self.proxy_int.signal()
+        self.host_bp.remove(sq.data_id)
+
+    def _transfer_s2h(self, sq: SQEntry):
+        buf = self.sidecar_bp.read(sq.data_id)
+        if not buf: return
+        self.host_bp.write(BufferEntry(sq.data_id, buf.headers, buf.body, buf.query_string, buf.remote_addr))
+        self.host_cq.put(CQEntry(sq.req_id, sq.data_id, sq.op_type))
+        self.app_int.signal()
+        self.sidecar_bp.remove(sq.data_id)
 
 
-# ===== Main DPULib Class =====
+# ========================================================================================
+# 3. GLOBAL SHARED OBJECTS (Multiprocessing IPC)
+# ========================================================================================
+
+_mp_manager = None
+_global_ingress_q = None       # TCP Bridge -> Any Worker
+_global_egress_req_q = None    # Any Worker -> DPU Host SQ
+_global_bridge_tx_q = None     # Any Worker -> TCP Bridge (Response)
+_worker_queues = {}            # WorkerID -> Response Queue (Local proxy in child, MP Queue in parent)
+_bridge_running = False        # Flag to ensure bridge threads start only once
+
+def _ensure_mp_init():
+    """Initialize MP shared objects. Called ONCE by the Main Process."""
+    global _mp_manager, _global_ingress_q, _global_egress_req_q, _global_bridge_tx_q
+    if _mp_manager is None:
+        _mp_manager = multiprocessing.Manager()
+        _global_ingress_q = _mp_manager.Queue()
+        _global_egress_req_q = _mp_manager.Queue()
+        _global_bridge_tx_q = _mp_manager.Queue()
+
+def get_shared_state():
+    """Returns a dict of shared objects to pass to child processes"""
+    _ensure_mp_init()
+    # Note: _worker_registry is a Manager.dict(), so it is proxy-safe to pass
+    return {
+        'ingress_q': _global_ingress_q,
+        'egress_req_q': _global_egress_req_q,
+        'bridge_tx_q': _global_bridge_tx_q,
+        'worker_registry': get_instance()._worker_registry
+    }
+
+def set_shared_state(state):
+    """Called by child process to adopt shared objects"""
+    global _global_ingress_q, _global_egress_req_q, _global_bridge_tx_q
+    _global_ingress_q = state['ingress_q']
+    _global_egress_req_q = state['egress_req_q']
+    _global_bridge_tx_q = state['bridge_tx_q']
+    # Adopt the registry proxy
+    get_instance()._worker_registry = state['worker_registry']
+
+
+# ========================================================================================
+# 4. DPULib (The Main Engine)
+# ========================================================================================
 
 class DPULib:
-    """
-    Hardware Abstraction Layer - Updated Architecture
-    
-    Components:
-      Host Side:
-        - host_sq: App writes outbound request metadata
-        - host_cq: App reads inbound response metadata
-        - host_bp: Shared buffer pool for request/response data
-        
-      DPA:
-        - dma_manager: Polls SQs, transfers data via DMA
-        
-      DPU Side:
-        - sidecar_cq: Proxy reads inbound request metadata (from DMA)
-        - sidecar_sq: Proxy writes outbound response metadata
-        - sidecar_bp: Sidecar buffer pool for request/response data
-        - L7 Proxy: simulated egress handler
-    
-    Interrupts:
-        - proxy_interrupt: DMA → Proxy (request arrived)
-        - app_interrupt: DMA → App (response arrived)
-    """
-    
     def __init__(self):
+        _ensure_mp_init()
+        
+        # --- Host Side (Internal to DPU process) ---
+        self._host_sq = Queue()
+        self._host_cq = Queue()
+        self._host_bp = BufferPool("Host")
+        
+        # --- Sidecar Side ---
+        self._sidecar_cq = Queue()
+        self._sidecar_sq = Queue()
+        self._sidecar_bp = BufferPool("Sidecar")
+        self._proxy_int = InterruptController("Proxy")
+        self._app_int = InterruptController("App")
+        
+        # --- Routing Table (ReqID -> WorkerID) ---
+        self._req_worker_map: Dict[str, str] = {}
+        
+        # --- Worker Queues (Managed by DPU) ---
+        self._worker_registry = _mp_manager.dict()
+        
         self._id_counter = 0
         self._lock = threading.Lock()
         
-        # ----- Host Side -----
-        self._host_sq = Queue()          # App → DMA (request metadata)
-        self._host_cq = Queue()          # DMA → App (response metadata)
-        self._host_bp = BufferPool("Host")
-        
-        # ----- DPU/Sidecar Side -----
-        self._sidecar_cq = Queue()       # DMA → Proxy (request metadata)
-        self._sidecar_sq = Queue()       # Proxy → DMA (response metadata)
-        self._sidecar_bp = BufferPool("Sidecar")
-        
-        # ----- Interrupts -----
-        self._proxy_interrupt = InterruptController("Proxy")
-        self._app_interrupt = InterruptController("App")
-        
-        # ----- Egress tracking (for blocking wait mode) -----
-        self._pending_egress: Dict[int, threading.Event] = {}
-        self._egress_responses: Dict[int, EgressResponse] = {}
-        
-        # ----- TCP Bridge (external traffic injection) -----
-        self._active_connections: Dict[int, socket.socket] = {}
-        
-        # ----- Start Components -----
-        
-        # 1. DMA Manager
-        self._dma_manager = DMAManager(
-            host_sq=self._host_sq,
-            host_cq=self._host_cq,
-            host_bp=self._host_bp,
-            sidecar_cq=self._sidecar_cq,
-            sidecar_sq=self._sidecar_sq,
-            sidecar_bp=self._sidecar_bp,
-            proxy_interrupt=self._proxy_interrupt,
-            app_interrupt=self._app_interrupt
-        )
-        self._dma_manager.start()
-        
-        # 2. TCP Bridge (simulates external client traffic)
-        self._bridge_thread = threading.Thread(
-            target=self._run_tcp_bridge, daemon=True, name="TCP-Bridge"
-        )
-        self._bridge_thread.start()
-        
-        # 3. L7 Proxy Simulator (handles egress on sidecar side)
-        self._proxy_thread = threading.Thread(
-            target=self._run_proxy_simulator, daemon=True, name="L7-Proxy"
-        )
-        self._proxy_thread.start()
-    
-    def _next_id(self) -> int:
-        with self._lock:
-            self._id_counter += 1
-            return self._id_counter
-    
-    # ================================================================
-    # Public API (Application / Server facing) - Same interface as v1
-    # ================================================================
-    
-    def poll_ingress_sq(self) -> Optional[IngressRequest]:
-        """
-        App polls for new client requests.
-        
-        In real HW: App busy-polls Host CQ after interrupt from DMA.
-        Here we translate from the TCP bridge's injected ingress path.
-        
-        Note: For ingress (client → app), the TCP bridge puts requests
-        directly into a compatibility queue. In the full DPU flow,
-        ingress would also go through DMA, but the app-side interface
-        stays the same.
-        """
-        try:
-            return self._ingress_compat_queue.get_nowait()
-        except Empty:
-            return None
-    
-    def write_ingress_cq(self, response: IngressResponse):
-        """App finished processing, send response back to client"""
-        self._send_response_to_bridge(response)
-    
-    def submit_egress_request(self, method: str, url: str, headers: Dict, body: Optional[str]) -> int:
-        """
-        App submits outbound request to external service.
-        
-        Flow: 
-        1. Write data to Host Buffer Pool
-        2. Insert metadata to Host SQ
-        3. DMA Manager picks it up → transfers to Sidecar
-        4. L7 Proxy processes and forwards
-        """
-        req_id = self._next_id()
-        data_id = self._next_id()
-        
-        # 1. Write request data to Host Buffer Pool
-        buf_entry = BufferEntry(
-            data_id=data_id,
-            headers=headers or {},
-            body=body
-        )
-        self._host_bp.write(buf_entry)
-        
-        # 2. Insert metadata to Host SQ
-        sq_entry = SQEntry(
-            req_id=req_id,
-            data_id=data_id,
-            op_type=OpType.REQUEST,
-            method=method,
-            url=url
-        )
-        self._host_sq.put(sq_entry)
-        
-        # Track for blocking wait mode
-        self._pending_egress[req_id] = threading.Event()
-        
-        return req_id
-    
-    def wait_egress_response(self, req_id: int, timeout: float = 30.0) -> EgressResponse:
-        """Blocking wait for egress response (used in standalone mode)"""
-        event = self._pending_egress.get(req_id)
-        if not event or not event.wait(timeout):
-            raise TimeoutError(f"Timeout waiting for egress response {req_id}")
-        resp = self._egress_responses.pop(req_id)
-        del self._pending_egress[req_id]
-        return resp
-    
-    def poll_egress_cq(self) -> Optional[EgressResponse]:
-        """
-        App polls for egress responses.
-        
-        In real HW: App busy-polls Host CQ after app_interrupt.
-        Here: check the compatibility response queue.
-        """
-        try:
-            return self._egress_response_queue.get_nowait()
-        except Empty:
-            return None
-    
-    def wait_interrupt(self):
-        """
-        App waits for interrupt (response ready).
-        Uses hybrid: check interrupt flag, fallback to short sleep.
-        """
-        if not self._app_interrupt.wait(timeout=0.001):
-            pass  # Timeout, will re-poll
-    
-    # ================================================================
-    # Internal: TCP Bridge (External traffic injection)
-    # ================================================================
-    
-    # Compatibility queue for ingress (TCP bridge → App)
-    _ingress_compat_queue: Queue = None
-    _egress_response_queue: Queue = None
-    
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-    
-    def _run_tcp_bridge(self):
-        """Listens on port 5005 for external test scripts"""
-        # Initialize compat queues
-        self._ingress_compat_queue = Queue()
-        self._egress_response_queue = Queue()
-        
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            server_sock.bind(('0.0.0.0', 5005))
-            server_sock.listen(5)
-            print("[DPU-LIB] TCP Bridge listening on port 5005...", flush=True)
+        # --- Start Components (ENSURE ONCE) ---
+        global _bridge_running
+        if not _bridge_running:
+            _bridge_running = True
             
-            while True:
-                conn, addr = server_sock.accept()
-                threading.Thread(
-                    target=self._handle_client_conn, args=(conn,), daemon=True
-                ).start()
-        except Exception as e:
-            print(f"[DPU-LIB] Bridge Error: {e}", flush=True)
-    
-    def _handle_client_conn(self, conn):
-        """Reads JSON request from socket → creates IngressRequest"""
-        try:
-            buffer = b""
-            while True:
-                data = conn.recv(4096)
-                if not data:
-                    break
-                buffer += data
-                
-                try:
-                    payload = json.loads(buffer.decode())
-                    req_id = self._next_id()
-                    
-                    self._active_connections[req_id] = conn
-                    
-                    req = IngressRequest(
-                        req_id=req_id,
-                        method=payload.get('method', 'GET'),
-                        path=payload.get('path', '/'),
-                        headers=payload.get('headers', {}),
-                        body=payload.get('body', None),
-                        query_string=payload.get('query_string', ''),
-                        remote_addr=str(conn.getpeername())
-                    )
-                    
-                    print(f"[DPU-LIB] Received external request ID {req_id}", flush=True)
-                    self._ingress_compat_queue.put(req)
-                    break
-                except json.JSONDecodeError:
-                    continue
-        except Exception as e:
-            print(f"[DPU-LIB] Client Handler Error: {e}", flush=True)
-    
-    def _send_response_to_bridge(self, response: IngressResponse):
-        """Writes response back to TCP socket"""
-        conn = self._active_connections.pop(response.req_id, None)
-        if conn:
-            try:
-                resp_data = {
-                    'req_id': response.req_id,
-                    'status': response.status_code,
-                    'headers': response.headers,
-                    'body': response.body
-                }
-                conn.sendall(json.dumps(resp_data).encode())
-                conn.close()
-                print(f"[DPU-LIB] Sent response for ID {response.req_id}", flush=True)
-            except Exception as e:
-                print(f"[DPU-LIB] Send Error: {e}", flush=True)
-    
-    # ================================================================
-    # Internal: L7 Proxy Simulator (runs on DPU side)
-    # ================================================================
-    
-    def _run_proxy_simulator(self):
-        """
-        Simulates L7 Proxy on DPU side.
-        
-        Flow:
-        1. Wait for proxy_interrupt (DMA transferred request to Sidecar CQ)
-        2. Read CQ entry from Sidecar CQ
-        3. Read data from Sidecar Buffer Pool
-        4. L7 Processing (routing, mTLS, etc.)
-        5. Forward to network (simulated)
-        6. Receive response
-        7. Write response to Sidecar Buffer Pool
-        8. Insert response metadata to Sidecar SQ
-        9. DMA Manager transfers back to Host
-        """
-        # Wait for initialization
-        time.sleep(0.1)
-        
+            self._dma = DMAManager(self._host_sq, self._host_cq, self._host_bp,
+                                   self._sidecar_cq, self._sidecar_sq, self._sidecar_bp,
+                                   self._proxy_int, self._app_int)
+            
+            threading.Thread(target=self._run_tcp_bridge, daemon=True, name="TCP-Bridge").start()
+            threading.Thread(target=self._run_proxy_simulator, daemon=True, name="L7-Proxy").start()
+            threading.Thread(target=self._run_egress_dispatcher, daemon=True, name="Egress-Dispatch").start()
+            threading.Thread(target=self._run_egress_collector, daemon=True, name="Egress-Collect").start()
+            threading.Thread(target=self._run_bridge_tx, daemon=True, name="Bridge-TX").start()
+
+            print("[DPU-LIB] Engine Components Started (Bridge/Proxy/DMA)", flush=True)
+        else:
+             print("[DPU-LIB] Engine Components already running (Skipped)", flush=True)
+
+        print("[DPU-LIB] Engine Initialized (Unified MP Mode)", flush=True)
+
+    def _next_id(self):
+        with self._lock: self._id_counter += 1; return self._id_counter
+
+    # --- Egress Dispatcher (Worker -> Host SQ) ---
+    def _run_egress_dispatcher(self):
         while True:
-            # Hybrid: interrupt + busy polling
-            self._proxy_interrupt.wait(timeout=0.01)
-            
-            # Busy poll Sidecar CQ
             try:
-                cq_entry = self._sidecar_cq.get_nowait()
-            except Empty:
-                continue
-            
-            # Read request data from Sidecar Buffer Pool
-            buf = self._sidecar_bp.read(cq_entry.data_id)
-            if buf is None:
-                continue
-            
-            # Spawn thread for each request (simulate network I/O)
-            threading.Thread(
-                target=self._proxy_handle_request,
-                args=(cq_entry, buf),
-                daemon=True
-            ).start()
-    
-    def _proxy_handle_request(self, cq_entry: CQEntry, buf: BufferEntry):
-        """Handle a single egress request in the proxy"""
-        try:
-            # L7 Processing (routing, mTLS, header manipulation, etc.)
-            # ... simulated ...
-            
-            # Forward to network and get response (simulated)
-            time.sleep(0.05)  # Simulate network latency
-            
-            resp_body = json.dumps({"message": f"Hello from proxy"})
-            resp_headers = {'Content-Type': 'application/json'}
-            
-            # Write response data to Sidecar Buffer Pool
-            resp_data_id = self._next_id()
-            resp_buf = BufferEntry(
-                data_id=resp_data_id,
-                headers=resp_headers,
-                body=resp_body
-            )
-            self._sidecar_bp.write(resp_buf)
-            
-            # Insert response metadata to Sidecar SQ
-            resp_sq = SQEntry(
-                req_id=cq_entry.req_id,
-                data_id=resp_data_id,
-                op_type=OpType.RESPONSE
-            )
-            self._sidecar_sq.put(resp_sq)
-            
-            # DMA Manager will poll Sidecar SQ, transfer to Host,
-            # and interrupt App
-            
-            # === Also notify via legacy egress path ===
-            egress_resp = EgressResponse(
-                req_id=cq_entry.req_id,
-                status_code=200,
-                headers=resp_headers,
-                body=resp_body
-            )
-            
-            if hasattr(self, '_egress_response_queue') and self._egress_response_queue:
-                self._egress_response_queue.put(egress_resp)
-            
-            # Wake up blocking waiters
-            with self._lock:
-                event = self._pending_egress.get(cq_entry.req_id)
-                if event:
-                    self._egress_responses[cq_entry.req_id] = egress_resp
-                    event.set()
+                # Get request from ANY worker
+                # Item: (worker_id, req_id, method, url, headers, body)
+                item = _global_egress_req_q.get()
+                wid, rid, method, url, headers, body = item
+                
+                # Store routing info
+                self._req_worker_map[rid] = wid
+                
+                # Write to Host BP/SQ
+                did = self._next_id()
+                self._host_bp.write(BufferEntry(did, headers or {}, body))
+                self._host_sq.put(SQEntry(rid, did, OpType.REQUEST, method=method, url=url))
+                
+            except Exception as e:
+                print(f"[Dispatch] Error: {e}", flush=True)
+
+    # --- Egress Collector (Host CQ -> Worker Queue) ---
+    def _run_egress_collector(self):
+        while True:
+            self._app_int.wait(0.01)
+            while True:
+                try:
+                    cq = self._host_cq.get_nowait()
+                    buf = self._host_bp.read(cq.data_id)
+                    if not buf: continue
+                    self._host_bp.remove(cq.data_id)
                     
-        except Exception as e:
-            print(f"[L7-Proxy] Error handling request {cq_entry.req_id}: {e}", flush=True)
+                    # Find Worker
+                    wid = self._req_worker_map.pop(cq.req_id, None)
+                    if wid:
+                        resp = EgressResponse(cq.req_id, 200, buf.headers, buf.body)
+                        # Look up worker queue
+                        if wid in self._worker_registry:
+                            try:
+                                self._worker_registry[wid].put(resp)
+                            except Exception:
+                                pass # Worker might have died
+                except Empty: break
+
+    # --- TCP Bridge ---
+    def _run_tcp_bridge(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._active_conns = {}
+        try:
+            sock.bind(('0.0.0.0', 5005))
+            sock.listen(100)
+            while True:
+                conn, _ = sock.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+        except Exception: pass
+        
+    def _handle_client(self, conn):
+        buf = b""
+        try:
+            while True:
+                d = conn.recv(4096)
+                if not d: break
+                buf += d
+                try:
+                    p = json.loads(buf.decode())
+                    rid = str(uuid.uuid4())
+                    self._active_conns[rid] = conn
+                    req = IngressRequest(rid, p.get('method','GET'), p.get('path','/'),
+                                         p.get('headers',{}), p.get('body',''), p.get('query_string',''), '127.0.0.1')
+                    _global_ingress_q.put(req)
+                    break
+                except: continue
+        except: pass
+
+    def _run_bridge_tx(self):
+        while True:
+            try:
+                resp = _global_bridge_tx_q.get()
+                conn = self._active_conns.pop(resp.req_id, None)
+                if conn:
+                    conn.sendall(json.dumps({'req_id':resp.req_id, 'status':resp.status_code, 'body':resp.body}).encode())
+                    conn.close()
+            except: pass
+
+    # --- Proxy Simulator ---
+    def _run_proxy_simulator(self):
+        time.sleep(0.1)
+        while True:
+            self._proxy_int.wait(0.01)
+            try:
+                cq = self._sidecar_cq.get_nowait()
+                buf = self._sidecar_bp.read(cq.data_id)
+                if buf:
+                    threading.Thread(target=self._proxy_logic, args=(cq, buf), daemon=True).start()
+            except Empty: pass
+
+    def _proxy_logic(self, cq, buf):
+        time.sleep(0.05) # Latency
+        resp_body = json.dumps({"message": "Hello from Unified Proxy"})
+        did = self._next_id()
+        self._sidecar_bp.write(BufferEntry(did, {'Content-Type':'application/json'}, resp_body))
+        self._sidecar_sq.put(SQEntry(cq.req_id, did, OpType.RESPONSE))
 
 
-# ===== Singleton =====
-_instance = None
-_init_lock = threading.Lock()
+# ========================================================================================
+# 5. CLIENT API (Used by Worker Processes)
+# ========================================================================================
 
-def _get_instance():
-    global _instance
-    if _instance is None:
-        with _init_lock:
-            if _instance is None:
-                _instance = DPULib()
-    return _instance
+_local_worker_id = None
+_local_worker_q = None
 
+def register_worker(worker_id=None):
+    """Call this at the start of a Worker Process"""
+    global _local_worker_id, _local_worker_q
+    
+    # 1. Ensure we have shared objects (inherited or from manager)
+    if _global_egress_req_q is None:
+        # If we are the main process or purely threaded, this might fail if not init
+        # But typically we call get_instance() first.
+        pass
 
-# ===== API Exports (backward compatible) =====
+    if worker_id is None:
+        worker_id = str(os.getpid())
+    
+    _local_worker_id = worker_id
+    
+    # Create a queue for this worker
+    # Note: We must create it using the Manager if we are in a child process? 
+    # Or just a normal Queue? Normal Queue created in child cannot be read by parent unless passed?
+    # Actually, Manager.Queue() is best.
+    # To get a Manager Queue here, we need the manager.
+    # But passing the manager to children is tricky.
+    # 
+    # WORKAROUND: In MP mode, the parent creates N queues and passes them?
+    # OR: We use the `_worker_registry` which is a Manager.dict().
+    # We can put a `manager.Queue()` into it. But the child doesn't have the manager.
+    # 
+    # SIMPLIFICATION: We will assume the parent created the Queues OR
+    # we use a helper to request a queue creation.
+    #
+    # Let's trust that `_mp_manager` is available if we are forked? No, managers are not shared like that.
+    #
+    # REVISED STRATEGY: 
+    # The Child process creates a local Queue? No, IPC.
+    #
+    # Let's fallback to: Parent creates queues in `server.py` and passes them in `shared_state`.
+    # `shared_state` will contain `worker_queues` dict (pre-populated) OR a `create_queue` lambda?
+    #
+    # ACTUALLY: The easiest way for this code is to assume `_worker_registry` is a proxy.
+    # But creating a queue *inside* a child that is visible to parent is hard without the manager.
+    #
+    # SOLUTION for this file:
+    # We will assume `set_shared_state` passed a `worker_registry` (DictProxy).
+    # But we can't create a Queue to put in it.
+    #
+    # ALTERNATIVE: One global "Response Dispatcher Queue" (WorkerID, Resp)?
+    # Then each worker filters? No, that's broadcasting.
+    #
+    # BEST APPROACH:
+    # Use a "Callback Queue" created by the Manager in the Parent.
+    # The parent (DPULib) exposes a method `create_worker_queue(wid)`.
+    # But we can't call parent methods.
+    #
+    # OK, let's look at `server.py`. It spawns processes. It has the manager.
+    # It should create the queue and pass it to the worker.
+    # So `register_worker` just needs to accept the queue object.
+    pass
+
+def register_worker_with_queue(wid, queue):
+    """
+    Called by the worker process startup code.
+    Registers the queue in the global registry (so DPU can see it).
+    """
+    global _local_worker_id, _local_worker_q
+    _local_worker_id = wid
+    _local_worker_q = queue
+    
+    # Register in the shared dictionary
+    # Since _worker_registry is a Manager Dict Proxy, this works across processes
+    get_instance()._worker_registry[wid] = queue
+    print(f"[Worker] Registered {wid} with DPU", flush=True)
+
 def poll_ingress_sq():
-    return _get_instance().poll_ingress_sq()
+    """Get request from global load-balanced queue"""
+    try:
+        return _global_ingress_q.get_nowait()
+    except: return None
 
 def write_ingress_cq(r):
-    _get_instance().write_ingress_cq(r)
+    _global_bridge_tx_q.put(r)
 
 def submit_egress_request(method, url, headers, body):
-    return _get_instance().submit_egress_request(method, url, headers, body)
+    req_id = str(uuid.uuid4())
+    # Send (WorkerID, ReqID, ...)
+    _global_egress_req_q.put((_local_worker_id, req_id, method, url, headers, body))
+    return req_id
 
 def poll_egress_cq():
-    return _get_instance().poll_egress_cq()
+    """Non-blocking poll of LOCAL worker queue"""
+    try:
+        return _local_worker_q.get_nowait()
+    except: return None
+
+def wait_egress_response(req_id, timeout=30):
+    """Blocking wait on LOCAL worker queue"""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            # Wait for any response
+            resp = _local_worker_q.get(timeout=0.1)
+            
+            if resp.req_id == req_id:
+                return resp
+            
+            # If not ours, it means we have a pipeline issue or stray response.
+            # In strict blocking mode, this is rare. Ideally we should buffer it.
+            # For now, let's print a warning and drop it (or push back if possible?)
+            # Queues don't support push back.
+            # Warning: This response is now LOST.
+            # To fix: Use a local buffer dict?
+            # 
+            # Implement simple local buffer for safety:
+            if not hasattr(_local_worker_q, '_buffer'):
+                _local_worker_q._buffer = {}
+            _local_worker_q._buffer[resp.req_id] = resp
+            
+        except Empty:
+            # Check buffer
+            if hasattr(_local_worker_q, '_buffer') and req_id in _local_worker_q._buffer:
+                 return _local_worker_q._buffer.pop(req_id)
+            continue
+            
+    raise TimeoutError(f"Timeout {req_id}")
 
 def wait_interrupt():
-    _get_instance().wait_interrupt()
+    time.sleep(0.001)
 
-def wait_egress_response(rid, t=30):
-    return _get_instance().wait_egress_response(rid, t)
+# ===== Singleton Access =====
+_inst = None
+def get_instance():
+    global _inst
+    if _inst is None:
+        _inst = DPULib()
+    return _inst
+
+def get_worker_registry():
+    return get_instance()._worker_registry

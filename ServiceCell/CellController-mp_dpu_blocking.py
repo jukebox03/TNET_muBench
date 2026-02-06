@@ -137,15 +137,26 @@ def start_worker():
                 jaeger_headers[jhdr] = val
 
         # if POST check the presence of a trace
-        trace=dict()
+        trace = {}
         if request.method == 'POST':
-            trace = request.json
+            trace = request.get_json(force=True, silent=True)
+            if trace is None:
+                app.logger.warning("Empty or invalid JSON body in POST request")
+                trace = {}
+
+        if trace and len(trace) > 0:
             # sanity_check
-            assert len(trace.keys())==1, 'bad trace format'
-            assert ID == list(trace)[0].split(traceEscapeString)[0], "bad trace format, ID"
-            trace[ID] = trace[list(trace)[0]] # We insert 1 more key "s0": [value] 
+            if len(trace.keys()) != 1:
+                app.logger.error(f"Bad trace format: keys={list(trace.keys())}")
+                return make_response(json.dumps({"message": "bad trace format"}), 400)
             
-        if len(trace)>0:
+            trace_key = list(trace.keys())[0]
+            if ID != trace_key.split(traceEscapeString)[0]:
+                app.logger.error(f"Bad trace format: ID mismatch {ID} vs {trace_key}")
+            
+            trace[ID] = trace[trace_key]
+            
+        if trace and ID in trace and len(trace[ID]) > 0:
         # trace-driven request
             n_groups = len(trace[ID])
             my_service_graph = list()
