@@ -8,14 +8,16 @@ import time
 import traceback
 from threading import Thread
 from concurrent import futures
+#from multiprocessing import Array, Manager, Value
 
 # ===== REMOVED: gunicorn.app.base =====
 from flask import Flask, Response, json, make_response, request
 import prometheus_client
 from prometheus_client import CollectorRegistry, Summary, multiprocess, Histogram
 
-from ExternalServiceExecutor_dpu import init_REST, init_gRPC, run_external_service
+from ExternalServiceExecutor_dpu_blocking import init_REST, init_gRPC, run_external_service
 from InternalServiceExecutor import run_internal_service
+from dpumesh.server import ThreadingDPUServer
 
 import mub_pb2_grpc as pb2_grpc
 import mub_pb2 as pb2
@@ -45,8 +47,8 @@ app = Flask(__name__)
 ID = os.environ["APP"]
 ZONE = os.environ["ZONE"]  # Pod Zone
 K8S_APP = os.environ["K8S_APP"]  # K8s label app
-PN = os.environ.get("PN", "4")  # Number of processes
-TN = os.environ.get("TN", "16")  # Number of thread per process
+PN = os.environ["PN"] # Number of processes
+TN = os.environ["TN"] # Number of thread per process
 traceEscapeString = "__"
 
 #globalDict=Manager().dict()
@@ -196,7 +198,7 @@ def start_worker():
 
         return response
     except Exception as err:
-        app.logger.error(f"Error in start_worker: {err}")
+        app.logger.error("Error in start_worker", err)
         # app.logger.error(traceback.format_exc())
         return json.dumps({"message": "Error"}), 500
 
@@ -205,27 +207,84 @@ def start_worker():
 def metrics():
     return Response(prometheus_client.generate_latest(registry), mimetype=CONTENT_TYPE_LATEST)
 
+# GRPC (no multi-process)
+gRPC_port = 51313
+class gRPCThread(Thread, pb2_grpc.MicroServiceServicer):
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=int(TN)))
 
-# ===== REMOVED: Gunicorn HttpServer class =====
-# ===== REMOVED: gRPC server (for now) =====
+    def __init__(self):
+        Thread.__init__(self)
 
+    def GetMicroServiceResponse(self, req, context):
+        try:
+            start_request_processing = time.time()
+            app.logger.info.info('Request Received')
+            message = req.message
+            remote_address = context.peer().split(":")[1]
+            app.logger.info(f'I am service: {ID} and I received this message: --> "{message}"')
+
+            # Execute the internal service
+            app.logger.info("*************** INTERNAL SERVICE STARTED ***************")
+            start_local_processing = time.time()
+            body = run_internal_service(my_work_model["internal_service"])
+            local_processing_latency = time.time() - start_local_processing
+            INTERNAL_PROCESSING.labels(ZONE, K8S_APP, "grpc", "grpc").observe(local_processing_latency*1000)
+            RESPONSE_SIZE.labels(ZONE, K8S_APP, "grpc", "grpc", remote_address, ID).observe(len(body))
+            app.logger.info("len(body): %d" % len(body))
+            app.logger.info("############### INTERNAL SERVICE FINISHED! ###############")
+
+            # Execute the external services
+            app.logger.info("*************** EXTERNAL SERVICES STARTED ***************")
+            start_external_request_processing = time.time()
+            if len(my_service_graph) > 0:
+                service_error_dict = run_external_service(my_service_graph, globalDict['work_model'])
+                if len(service_error_dict):
+                    app.logger.error(service_error_dict)
+                    app.logger.error("Error in request external services")
+                    app.logger.error(service_error_dict)
+                    result = {'text': f"Error in external services request", 'status_code': False}
+                    return pb2.MessageResponse(**result)
+            app.logger.info("############### EXTERNAL SERVICES FINISHED! ###############")
+
+            result = {'text': body, 'status_code': True}
+            EXTERNAL_PROCESSING.labels(ZONE, K8S_APP, "grpc", "grpc").observe((time.time() - start_external_request_processing)*1000)
+            REQUEST_PROCESSING.labels(ZONE, K8S_APP, "grpc", "grpc", remote_address, ID).observe(
+                (time.time() - start_request_processing)*1000)
+            return pb2.MessageResponse(**result)
+        except Exception as err:
+            app.logger.error("Error: in GetMicroServiceResponse,", err)
+            result = {'text': f"Error: in GetMicroServiceResponse, {str(err)}", 'status_code': False}
+            return pb2.MessageResponse(**result)
+
+    def run(self):
+        pb2_grpc.add_MicroServiceServicer_to_server(self, self.server)
+        self.server.add_insecure_port(f'[::]:{gRPC_port}')
+        self.server.start()
 
 if __name__ == '__main__':
     if request_method == "rest":
         init_REST(app)
         
-        # ===== CHANGED: Use dpumesh-server instead of Gunicorn =====
-        from dpumesh.server import DPUmeshServer, set_server
+        # ===== CHANGED: Use ThreadingDPUServer instead of Gunicorn =====
+        # This allows blocking logic to run on DPU Ingress events via a Thread Pool
         
-        server = DPUmeshServer(app, host='0.0.0.0', port=8080)
-        set_server(server)  # ← CRITICAL: register server for requests.submit()
+        # PN (Process Number) was for Gunicorn workers. 
+        # Here we use it (or TN) to define thread pool size.
+        workers = int(PN) * int(TN) # Total concurrency
+        
+        server = ThreadingDPUServer(app, host='0.0.0.0', port=8080, workers=workers)
         server.run()
         # ==========================================================
         
     elif request_method == "grpc":
-        # gRPC not yet supported in DPU mode
-        print("gRPC mode not yet supported with DPUmesh")
-        sys.exit(1)
+        my_work_model = globalDict['work_model'][ID]
+        my_service_graph = my_work_model['external_services']
+        init_gRPC(my_service_graph, globalDict['work_model'], gRPC_port,app)
+        # Start the gRPC server
+        grpc_thread = gRPCThread()
+        grpc_thread.run()
+        # Flask HTTP REST server started for Prometheus metrics and for the entry point (s0) that anyway receives REST requests from API gateway
+        app.run(host='0.0.0.0', port=8080, threaded=True)
     else:
         app.logger.info("Error: Unsupported request method")
         sys.exit(0)

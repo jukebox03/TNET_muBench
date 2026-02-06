@@ -82,4 +82,6 @@ def run_load_test():
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         TARGET_HOST = sys.argv[1]
+    if len(sys.argv) > 2:
+        TARGET_PORT = int(sys.argv[2])
     run_load_test()
