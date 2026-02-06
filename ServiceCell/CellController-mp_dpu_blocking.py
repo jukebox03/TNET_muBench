@@ -4,6 +4,10 @@ import argparse
 import json
 import os
 import sys
+
+# CRITICAL: Force Multi-Process Mode BEFORE importing any dpumesh modules
+os.environ['DPUMESH_MP_MODE'] = '1'
+
 import time
 import traceback
 from threading import Thread
@@ -17,7 +21,7 @@ from prometheus_client import CollectorRegistry, Summary, multiprocess, Histogra
 
 from ExternalServiceExecutor_dpu_blocking import init_REST, init_gRPC, run_external_service
 from InternalServiceExecutor import run_internal_service
-from dpumesh.server import ThreadingDPUServer
+from dpumesh.server import ProcessDPUServer
 
 import mub_pb2_grpc as pb2_grpc
 import mub_pb2 as pb2
@@ -265,14 +269,19 @@ if __name__ == '__main__':
     if request_method == "rest":
         init_REST(app)
         
-        # ===== CHANGED: Use ThreadingDPUServer instead of Gunicorn =====
-        # This allows blocking logic to run on DPU Ingress events via a Thread Pool
+        # ===== CHANGED: Use ProcessDPUServer for Multi-Process Parallelism =====
         
-        # PN (Process Number) was for Gunicorn workers. 
-        # Here we use it (or TN) to define thread pool size.
-        workers = int(PN) * int(TN) # Total concurrency
+        # PN (Process Number) * TN (Thread Number) = Total concurrency
+        # Since we use Processes, we might want to stick to PN workers, or PN*TN.
+        # Given we want to beat GIL, let's use PN * TN processes (heavy but true parallel)
+        # OR use PN processes, each with TN threads?
+        # Our ProcessDPUServer uses a ProcessPool. So workers = Number of Processes.
+        # Threads inside processes are not supported by this simple server yet (it calls app() directly).
+        # So we treat workers as total concurrent requests.
+        workers = int(PN) * int(TN) 
         
-        server = ThreadingDPUServer(app, host='0.0.0.0', port=8080, workers=workers)
+        # Note: Must pass STRING path for MP
+        server = ProcessDPUServer("CellController-mp_dpu_blocking:app", host='0.0.0.0', port=8080, workers=workers)
         server.run()
         # ==========================================================
         

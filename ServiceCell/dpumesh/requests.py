@@ -9,19 +9,24 @@ Session.get/post provides requests.Session compatible interface (blocking).
 """
 
 import json
+import os
 from typing import Optional, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from . import dpu_lib
+# Dynamic Import based on Mode
+if os.environ.get('DPUMESH_MP_MODE') == '1':
+    from . import dpu_lib_mp as dpu_lib
+else:
+    from . import dpu_lib
 
 
 @dataclass
 class Response:
-    """Compatible with requests.Response"""
-    status_code: int
-    text: str
-    headers: Dict[str, str]
-    content: bytes
+    """Compatible with requests.Response - supports empty constructor for error handling"""
+    status_code: int = 0
+    text: str = ""
+    headers: Dict[str, str] = field(default_factory=dict)
+    content: bytes = b""
     
     def json(self):
         return json.loads(self.text)

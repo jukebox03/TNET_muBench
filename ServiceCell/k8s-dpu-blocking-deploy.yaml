@@ -35,3 +35,7 @@ spec:
           value: "us-west-1"
         - name: K8S_APP
           value: "mubench-app"
+        - name: PN
+          value: "1"
+        - name: TN
+          value: "50"
