@@ -8,19 +8,19 @@ import random
 # Configuration
 CONCURRENT_REQUESTS = 50  # Number of parallel clients
 TARGET_HOST = 'localhost'
-TARGET_PORT = 30005
+TARGET_PORT = 5050
 
 def send_request(client_id):
     """
     Sends a single request and measures latency.
     """
     req_data = {
-        "method": "POST",
-        "path": "/api/v1",
-        "headers": {"Content-Type": "application/json"},
-        # Trace: s0 calls s1, s2 (Simulates workload)
-        "body": json.dumps({"s0": [{"s1": {}, "s2": {}}]}),
-        "query_string": ""
+        'method': 'POST',
+        'path': '/api/v1',
+        'target_service': 's0',
+        'headers': {'Content-Type': 'application/json'},
+        'body': json.dumps({'s0': [{'s1': {}, 's2': {}}]}),
+        'query_string': ''
     }
 
     start_time = time.time()

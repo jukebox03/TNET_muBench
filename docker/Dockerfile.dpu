@@ -1,0 +1,19 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Dependencies (kubernetes client for local pod discovery) + kubectl
+RUN apt-get update && apt-get install -y curl && \
+    pip install --no-cache-dir requests kubernetes && \
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    chmod +x kubectl && \
+    mv kubectl /usr/local/bin/
+
+# Copy dpumesh library
+COPY ServiceCell/dpumesh/ /app/dpumesh/
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+
+# Run Sidecar
+CMD ["python", "-m", "dpumesh.dpu_daemon"]

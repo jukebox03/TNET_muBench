@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dpu-daemon
+  namespace: dpumesh-system
+  labels:
+    app: dpu-daemon
+spec:
+  selector:
+    matchLabels:
+      app: dpu-daemon
+  template:
+    metadata:
+      labels:
+        app: dpu-daemon
+    spec:
+      hostNetwork: true
+      serviceAccountName: dpu-daemon
+      containers:
+      - name: dpu-daemon
+        image: dpumesh-dpu:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 5005
+          hostPort: 5005
+          name: bridge
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-dpu"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        securityContext:
+          privileged: true
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+      tolerations:
+      - operator: Exists

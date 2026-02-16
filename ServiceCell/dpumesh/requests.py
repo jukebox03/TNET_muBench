@@ -12,7 +12,7 @@ import json
 import os
 from typing import Optional, Dict
 from dataclasses import dataclass, field
-from . import dpu_lib
+from . import host_lib as dpu_lib
 
 
 @dataclass

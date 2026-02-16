@@ -1,0 +1,199 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mubench-blocking
+---
+# s0 Worker (Blocking)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s0-worker-blocking
+  namespace: mubench-blocking
+  labels:
+    app: s0-worker-blocking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s0-worker-blocking
+  template:
+    metadata:
+      labels:
+        app: s0-worker-blocking
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        command: ["python", "CellController-mp_dpu_blocking.py"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s0"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-blocking"
+        - name: PN
+          value: "4"
+        - name: TN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s0
+  namespace: mubench-blocking
+spec:
+  selector:
+    app: s0-worker-blocking
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# s1 Worker (Blocking)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s1-worker-blocking
+  namespace: mubench-blocking
+  labels:
+    app: s1-worker-blocking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s1-worker-blocking
+  template:
+    metadata:
+      labels:
+        app: s1-worker-blocking
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        command: ["python", "CellController-mp_dpu_blocking.py"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s1"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-blocking"
+        - name: PN
+          value: "4"
+        - name: TN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s1
+  namespace: mubench-blocking
+spec:
+  selector:
+    app: s1-worker-blocking
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# s2 Worker (Blocking)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s2-worker-blocking
+  namespace: mubench-blocking
+  labels:
+    app: s2-worker-blocking
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s2-worker-blocking
+  template:
+    metadata:
+      labels:
+        app: s2-worker-blocking
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        command: ["python", "CellController-mp_dpu_blocking.py"]
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s2"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-blocking"
+        - name: PN
+          value: "4"
+        - name: TN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s2
+  namespace: mubench-blocking
+spec:
+  selector:
+    app: s2-worker-blocking
+  ports:
+  - port: 80
+    targetPort: 8080

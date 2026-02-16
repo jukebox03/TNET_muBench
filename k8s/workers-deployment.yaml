@@ -1,0 +1,190 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mubench-dpu
+---
+# s0 Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s0-worker
+  namespace: mubench-dpu
+  labels:
+    app: s0-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s0-worker
+  template:
+    metadata:
+      labels:
+        app: s0-worker
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s0"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-dpu"
+        - name: PN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s0
+  namespace: mubench-dpu
+spec:
+  selector:
+    app: s0-worker
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# s1 Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s1-worker
+  namespace: mubench-dpu
+  labels:
+    app: s1-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s1-worker
+  template:
+    metadata:
+      labels:
+        app: s1-worker
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s1"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-dpu"
+        - name: PN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s1
+  namespace: mubench-dpu
+spec:
+  selector:
+    app: s1-worker
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# s2 Worker
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s2-worker
+  namespace: mubench-dpu
+  labels:
+    app: s2-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s2-worker
+  template:
+    metadata:
+      labels:
+        app: s2-worker
+    spec:
+      containers:
+      - name: worker
+        image: mubench-worker:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        env:
+        - name: APP
+          value: "s2"
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          value: "mubench-dpu"
+        - name: PN
+          value: "4"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: shm
+        hostPath:
+          path: /dev/shm
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s2
+  namespace: mubench-dpu
+spec:
+  selector:
+    app: s2-worker
+  ports:
+  - port: 80
+    targetPort: 8080

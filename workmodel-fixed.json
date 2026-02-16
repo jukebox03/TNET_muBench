@@ -17,7 +17,7 @@
     "request_method": "rest",
     "workers": 4,
     "threads": 16,
-    "url": "s0.mubench.svc.cluster.local",
+    "url": "s0.mubench-dpu.svc.cluster.local",
     "path": "/api/v1",
     "image": "msvcbench/microservice_v6-screen:1.0",
     "namespace": "mubench"
@@ -37,7 +37,7 @@
     "request_method": "rest",
     "workers": 4,
     "threads": 16,
-    "url": "s1.mubench.svc.cluster.local",
+    "url": "s1.mubench-dpu.svc.cluster.local",
     "path": "/api/v1",
     "image": "msvcbench/microservice_v6-screen:1.0",
     "namespace": "mubench"
@@ -57,7 +57,7 @@
     "request_method": "rest",
     "workers": 4,
     "threads": 16,
-    "url": "s2.mubench.svc.cluster.local",
+    "url": "s2.mubench-dpu.svc.cluster.local",
     "path": "/api/v1",
     "image": "msvcbench/microservice_v6-screen:1.0",
     "namespace": "mubench"
