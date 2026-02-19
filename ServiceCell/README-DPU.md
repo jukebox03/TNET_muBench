@@ -47,6 +47,15 @@ Node
           → (응답인 경우) TCP Bridge → 외부 클라이언트
 ```
 
+**SHM Queue 이름 규칙:**
+
+| Queue | 방향 | 용도 |
+|-------|------|------|
+| `worker_sq` | DMA Manager → Worker | Worker가 요청/응답 수신 |
+| `worker_cq` | Worker → DMA Manager | Worker가 요청/응답 송신 |
+| `sidecar_sq` | DMA Manager → Sidecar | Sidecar가 응답 수신 |
+| `sidecar_cq` | Sidecar → DMA Manager | Sidecar가 요청 송신 |
+
 ---
 
 ## Execution Graph
@@ -59,6 +68,16 @@ Node
 - **Non-blocking**: EgressStep은 SHM Queue, InternalStep은 ThreadPool로 실행
 - **Worker를 점유하지 않음**: Flask handler는 graph 등록 후 즉시 return
 
+### 핵심 개념
+
+| 요소 | 역할 | 설명 |
+|------|------|------|
+| **CellController** | 애플리케이션 진입점 | Flask 기반. 요청마다 `ExecutionContext`를 생성하고 작업을 정의 |
+| **ExecutionContext (`ctx`)** | 요청 생명주기 관리 | Step을 추가하여 실행할 작업을 예약 |
+| **InternalStep** | 내부 함수 실행 | CPU 연산 등. ThreadPool에서 non-blocking 실행 |
+| **EgressStep** | 외부 서비스 호출 | HTTP 요청. SHM Queue → Sidecar로 non-blocking 실행 |
+| **StepResult** | Step 실행 결과 | 이전 Step의 결과를 다음 Step에 전달 |
+
 ### 기본 요소
 
 | 요소 | 역할 | 실행 방식 |
@@ -68,13 +87,162 @@ Node
 | `EgressStep` | 외부 서비스 호출 | SHM Queue → Sidecar (non-blocking) |
 | `InternalStep` | 내부 함수 실행 | ThreadPool (non-blocking) |
 
+---
+
+## High-Level API Reference
+
+개발자는 주로 Flask 핸들러 내부에서 다음 API들을 사용합니다.
+
+### `dpumesh.get_context()`
+
+현재 요청에 대한 `ExecutionContext` 객체를 반환합니다. 반드시 Flask 라우트 핸들러 내부에서 호출해야 합니다.
+
+> **참고**: `get_current_context()`는 동일한 함수의 별칭(alias)입니다.
+
+### `ctx.run_internal(func, *, args=(), kwargs={}, inputs=[], id=None)`
+
+내부 함수(Python 함수) 실행을 예약합니다. 별도의 Worker Thread에서 비동기로 실행됩니다.
+
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `func` | Callable | 실행할 함수 객체 |
+| `args` | tuple | 함수에 전달할 위치 인자 |
+| `kwargs` | dict | 함수에 전달할 키워드 인자 |
+| `inputs` | list[str] | 의존하는 이전 Step의 ID 리스트. 지정된 Step들이 완료되어야 실행 |
+| `id` | str (optional) | Step의 고유 ID. 생략 시 자동 생성 |
+
+**반환값**: 생성된 Step ID (문자열). 다른 Step의 `inputs`로 사용 가능.
+
+### `ctx.call(method, url, *, headers={}, body=None, inputs=[], request_builder=None, id=None)`
+
+외부 서비스로의 HTTP 요청(Egress)을 예약합니다.
+
+| 파라미터 | 타입 | 설명 |
+|----------|------|------|
+| `method` | str | HTTP 메서드 ("GET", "POST" 등) |
+| `url` | str | 대상 서비스 URL |
+| `headers` | dict | 요청 헤더 |
+| `body` | str/bytes | 요청 본문 |
+| `inputs` | list[str] | 의존하는 이전 Step의 ID 리스트 |
+| `request_builder` | Callable (optional) | 동적 요청 생성 함수 (고급 기능 참조) |
+| `id` | str (optional) | Step의 고유 ID |
+
+**반환값**: 생성된 Step ID (문자열).
+
+### `with ctx.parallel():`
+
+병렬 실행 블록을 정의하는 Context Manager입니다. 블록 내부에서 호출된 `run_internal`이나 `call`은 서로 의존성 없이 **동시에** 실행됩니다.
+
+```python
+with ctx.parallel():
+    ctx.call("GET", "http://service-a")
+    ctx.call("GET", "http://service-b")
+# 두 요청이 동시에 전송됨
+```
+
+### 기본 사용 예제
+
+```python
+from dpumesh.server import get_context
+
+@app.route('/api/v1', methods=['GET', 'POST'])
+def handler():
+    ctx = get_context()
+    
+    if ctx is not None:
+        # Step 1: 내부 연산 (ThreadPool)
+        ctx.run_internal(process_data, args=(config,), id="process")
+        
+        # Step 2: 외부 호출 (병렬, SHM Queue)
+        with ctx.parallel():
+            ctx.call("GET", "http://svc-a/api/v1")
+            ctx.call("GET", "http://svc-b/api/v1")
+    
+    return ""  # 빈 응답 필수 — Server가 graph 실행 후 실제 응답으로 교체
+```
+
+---
+
+## 고급 기능 (Advanced Features)
+
+### 데이터 체이닝 (Data Chaining)
+
+이전 Step의 결과를 다음 Step에서 사용하려면 `inputs` 파라미터를 사용합니다. `inputs`에 지정된 Step ID가 **키워드 인자(Keyword Argument)**로 전달됩니다. 전달되는 값은 `StepResult` 객체입니다.
+
+```python
+def process_user_data(user_step):
+    # user_step은 StepResult 객체
+    return f"Hello, {user_step.body}"
+
+@app.route("/chain")
+def chain_handler():
+    ctx = get_context()
+    
+    # 1단계: 사용자 정보 가져오기 (ID: "get_user")
+    step1 = ctx.call("GET", "http://user-service/me", id="get_user")
+    
+    # 2단계: 데이터 가공 (1단계 결과에 의존)
+    # process_user_data(get_user=StepResult(...)) 형태로 호출됨
+    step2 = ctx.run_internal(process_user_data, inputs=[step1])
+    
+    return ""
+```
+
+### 동적 요청 생성 (Dynamic Request Builder)
+
+URL이나 Body가 이전 단계의 결과에 따라 결정되어야 할 때 `request_builder`를 사용합니다.
+
+- **함수 시그니처**: `def builder(**inputs) -> list[tuple]`
+- **반환값**: `[(method, url, headers, body)]` 형태의 튜플 리스트
+
+```python
+def build_req(config_step):
+    target_host = config_step.body.strip()
+    return [("POST", f"http://{target_host}/api", {}, "data")]
+
+@app.route("/dynamic")
+def dynamic_handler():
+    ctx = get_context()
+    
+    s1 = ctx.call("GET", "http://config-service/target", id="config_step")
+    
+    # url 파라미터는 무시됨 — request_builder의 반환값이 사용됨
+    ctx.call("GET", "dummy",
+             request_builder=build_req, 
+             inputs=[s1])
+    return ""
+```
+
+### 조건부 실행 (Conditional Execution)
+
+`request_builder`에서 **빈 리스트(`[]`)**를 반환하면 해당 Step은 실행되지 않고 넘어갑니다(Skip).
+
+```python
+def check_and_call(auth_step):
+    if auth_step.status_code != 200:
+        return []  # 인증 실패 시 호출 생략
+    return [("GET", "http://secure-service/data", {}, "")]
+```
+
+### Fan-Out (1:N 요청)
+
+하나의 `EgressStep`에서 순차적으로 여러 요청을 보낼 수 있습니다. `request_builder`가 여러 개의 튜플을 반환하면 됩니다. (병렬 실행을 원하면 `with ctx.parallel()`을 사용하세요.)
+
+---
+
+## Low-Level API (Manual Graph Construction)
+
+High-Level API(`ctx.run_internal`, `ctx.call`)는 내부적으로 Low-Level API를 사용하여 graph를 구성합니다. 일반적으로는 High-Level API를 권장하지만, graph 구조를 직접 프로그래밍 방식으로 조립해야 할 때 Low-Level API를 사용합니다.
+
+```python
+from dpumesh import order, pipe, EgressStep, InternalStep
+```
+
 ### `order(steps)` - 순차 실행
 
 안의 step들을 **순서대로** 실행합니다. 이전 step이 완료되어야 다음 step이 시작됩니다.
 
 ```python
-from dpumesh.server import order, EgressStep, InternalStep
-
 # A 완료 → B 완료 → C 완료
 order([
     EgressStep("A", requests=[("GET", "http://svc-a/api", {}, None)]),
@@ -88,8 +256,6 @@ order([
 안의 step들을 **동시에** 실행합니다. 모든 step이 완료되어야 다음으로 넘어갑니다.
 
 ```python
-from dpumesh.server import pipe, EgressStep
-
 # A, B, C 동시 실행
 pipe([
     EgressStep("A", requests=[("GET", "http://svc-a/api", {}, None)]),
@@ -173,16 +339,6 @@ def merge_results(fetch_user, fetch_order, config, timeout=30):
     return {"merged": {**user_data, **order_data}}
 ```
 
-**반환값**: 함수의 반환값은 자동으로 `StepResult`로 변환됩니다.
-
-| 반환 타입 | 변환 |
-|-----------|------|
-| `StepResult` | 그대로 사용 |
-| `str` | `StepResult(body=str)` |
-| `dict` | `StepResult(body=dict.body, status_code=dict.status_code)` |
-| `Exception` | `StepResult(status_code=500, error=str(e))` |
-| 기타 | `StepResult(body=str(value))` |
-
 ### `StepResult` - Step 실행 결과
 
 ```python
@@ -196,6 +352,16 @@ class StepResult:
     @property
     def ok(self) -> bool:  # 200-399면 True
 ```
+
+**InternalStep 반환값 → StepResult 변환 규칙:**
+
+| 반환 타입 | 변환 |
+|-----------|------|
+| `StepResult` | 그대로 사용 |
+| `str` | `StepResult(body=str)` |
+| `dict` | `StepResult(body=dict.body, status_code=dict.status_code)` |
+| `Exception` | `StepResult(status_code=500, error=str(e))` |
+| 기타 | `StepResult(body=str(value))` |
 
 ### 중첩 (Nesting)
 
@@ -266,14 +432,14 @@ order([
 └─ compute                                 ─┘
 ```
 
-### Flask handler에서 graph 등록
+### Low-Level API로 Flask handler에서 graph 등록
 
 ```python
-from dpumesh.server import get_current_context, order, pipe, EgressStep, InternalStep
+from dpumesh.server import get_context, order, pipe, EgressStep, InternalStep
 
 @app.route('/api/v1', methods=['GET', 'POST'])
 def handler():
-    ctx = get_current_context()
+    ctx = get_context()
     
     if ctx is not None:
         ctx.graph = order([
@@ -289,7 +455,9 @@ def handler():
     return ""
 ```
 
-### Server Event Loop
+---
+
+## Server Event Loop
 
 ```
 1. TCP 요청 → Sidecar → SHM Queue → DMA Manager → Worker SQ
@@ -444,6 +612,15 @@ sock.close()
 
 ---
 
+## 주의 사항 및 팁
+
+1. **핸들러 반환값**: Flask 핸들러는 항상 **빈 문자열 `""`**을 반환해야 합니다. 실제 클라이언트로의 응답은 그래프 실행이 모두 완료된 후 `dpumesh`가 자동으로 전송합니다. 마지막 Step의 결과가 최종 응답이 됩니다.
+2. **ID 중복 방지**: `id`를 수동으로 지정할 경우, 하나의 요청 내에서 중복되지 않도록 주의하세요. 가급적 자동 생성을 권장합니다.
+3. **디버깅**: `run_internal` 함수 내에서 `print()`를 사용하면 로그를 확인할 수 있습니다.
+4. **`get_context()` vs `get_current_context()`**: 동일한 함수입니다. `get_context()` 사용을 권장합니다.
+
+---
+
 ## 로그 확인
 
 ```bash
@@ -483,8 +660,8 @@ kubectl logs -n dpumesh-system -l app=dpa-daemon | grep "Worker discovered"
 ```bash
 # SHM 정리 후 전체 재시작
 kubectl exec -n dpumesh-system $(kubectl get pod -n dpumesh-system -l app=dpu-daemon -o name | head -1) -- bash -c "rm -f /dev/shm/dpumesh_*"
-kubectl rollout restart -n dpumesh-system deployment/dpu-daemon
-kubectl rollout restart -n dpumesh-system deployment/dpa-daemon
+kubectl rollout restart -n dpumesh-system daemonset/dpu-daemon
+kubectl rollout restart -n dpumesh-system daemonset/dpa-daemon
 kubectl rollout restart -n mubench-dpu deployment/s0-worker deployment/s1-worker deployment/s2-worker
 ```
 
@@ -499,6 +676,17 @@ kubectl delete -f k8s/dpu-daemonset.yaml
 kubectl delete namespace mubench-dpu
 kubectl delete namespace dpumesh-system
 ```
+
+---
+
+## 환경 변수
+
+| 변수 | 설명 | 기본값 | 설정 위치 |
+|------|------|--------|-----------|
+| `APP` | 서비스 이름 (s0, s1, s2 등) | - | Deployment YAML |
+| `ZONE` | Pod Zone 정보 | - | Deployment YAML |
+| `K8S_APP` | K8s label app | - | Deployment YAML |
+| `PN` | Worker 프로세스 수 | `4` | Deployment YAML |
 
 ---
 
@@ -534,15 +722,6 @@ TNET_muBench/
 ├── test_client.py                        # 테스트 클라이언트
 └── README.md
 ```
-
----
-
-## 환경 변수
-
-| 변수 | 설명 | 기본값 | 설정 위치 |
-|------|------|--------|-----------|
-| `APP` | 서비스 이름 (s0, s1, s2 등) | - | Deployment YAML |
-| `PN` | Worker 프로세스 수 | `4` | Deployment YAML |
 
 ---
 
