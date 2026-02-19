@@ -6,7 +6,7 @@ import threading
 import random
 
 # Configuration
-CONCURRENT_REQUESTS = 50  # Number of parallel clients
+CONCURRENT_REQUESTS = 100  # Number of parallel clients
 TARGET_HOST = 'localhost'
 TARGET_PORT = 5050
 

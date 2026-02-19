@@ -9,13 +9,18 @@ import traceback
 from threading import Thread
 from concurrent import futures
 
-# ===== REMOVED: gunicorn.app.base =====
 from flask import Flask, Response, json, make_response, request
 import prometheus_client
 from prometheus_client import CollectorRegistry, Summary, multiprocess, Histogram
 
 from ExternalServiceExecutor_dpu import init_REST, init_gRPC, run_external_service
 from InternalServiceExecutor import run_internal_service
+
+from dpumesh.server import (
+    get_current_context,
+    EgressStep, InternalStep, Order, Pipe,
+    order, pipe,
+)
 
 import mub_pb2_grpc as pb2_grpc
 import mub_pb2 as pb2
@@ -49,13 +54,11 @@ PN = os.environ.get("PN", "4")  # Number of processes
 TN = os.environ.get("TN", "16")  # Number of thread per process
 traceEscapeString = "__"
 
-#globalDict=Manager().dict()
 globalDict=dict()
 def read_config_files():
     res = dict()
     with open('MSConfig/workmodel.json') as f:
         workmodel = json.load(f)
-        # shrink workmodel
         for service in workmodel:
             app.logger.info(f'service: {service}')
             if service==ID:
@@ -63,7 +66,7 @@ def read_config_files():
             else:
                 res[service]={"url":workmodel[service]["url"],"path":workmodel[service]["path"]}
     return res
-globalDict['work_model'] = read_config_files()    # must be shared among processes for hot update
+globalDict['work_model'] = read_config_files()
 
 if "request_method" in globalDict['work_model'][ID].keys():
     request_method = globalDict['work_model'][ID]["request_method"].lower()
@@ -101,6 +104,11 @@ REQUEST_PROCESSING_BUCKET = Histogram('mub_request_processing_latency_millisecon
 )
 
 
+def _run_internal(my_internal_service):
+    """InternalStep에서 실행될 wrapper 함수"""
+    return run_internal_service(my_internal_service)
+
+
 @app.route(f"{globalDict['work_model'][ID]['path']}", methods=['GET','POST'])
 def start_worker():
     global globalDict
@@ -134,7 +142,6 @@ def start_worker():
         trace = {}
         if request.method == 'POST':
             try:
-                # Debug: Print raw data if needed
                 raw_data = request.get_data()
                 if not raw_data:
                      app.logger.warning("Empty raw body in POST")
@@ -148,7 +155,6 @@ def start_worker():
                 trace = {}
 
         if trace and len(trace) > 0:
-            # sanity_check
             if len(trace.keys()) != 1:
                 app.logger.error(f"Bad trace format: keys={list(trace.keys())}")
                 return make_response(json.dumps({"message": "bad trace format"}), 400)
@@ -156,12 +162,10 @@ def start_worker():
             trace_key = list(trace.keys())[0]
             if ID != trace_key.split(traceEscapeString)[0]:
                 app.logger.error(f"Bad trace format: ID mismatch {ID} vs {trace_key}")
-                # Optional: return 400 or just continue
             
             trace[ID] = trace[trace_key]
             
         if trace and ID in trace and len(trace[ID]) > 0:
-        # trace-driven request
             n_groups = len(trace[ID])
             my_service_graph = list()
             for i in range(0,n_groups):
@@ -171,55 +175,132 @@ def start_worker():
                 group_dict['services'] = list(group.keys())
                 my_service_graph.append(group_dict)
         else:
-            # update external service behaviour
             if behaviour_id != 'default' and "alternative_behaviors" in my_work_model.keys():
                 if behaviour_id in my_work_model['alternative_behaviors'].keys():
                     if "external_services" in my_work_model['alternative_behaviors'][behaviour_id].keys():
                         my_service_graph = my_work_model['alternative_behaviors'][behaviour_id]['external_services']
 
-        # Execute the internal service
-        app.logger.info("*************** INTERNAL SERVICE STARTED ***************")
-        start_local_processing = time.time()
-        body = run_internal_service(my_internal_service)
-        local_processing_latency = time.time() - start_local_processing
-        INTERNAL_PROCESSING.labels(ZONE, K8S_APP, request.method, request.path).observe(local_processing_latency*1000)
-        INTERNAL_PROCESSING_BUCKET.labels(ZONE, K8S_APP, request.method, request.path).observe(local_processing_latency*1000)
-        RESPONSE_SIZE.labels(ZONE, K8S_APP, request.method, request.path, request.remote_addr, ID).observe(len(body))
-        app.logger.info("len(body): %d" % len(body))
-        app.logger.info("############### INTERNAL SERVICE FINISHED! ###############")
-
-        # Execute the external services
-        start_external_request_processing = time.time()
-        app.logger.info("*************** EXTERNAL SERVICES STARTED ***************")
+        # ========================================================
+        # Build Execution Graph
+        # ========================================================
+        # 
+        # μBench pattern: Internal first, then External
+        # Graph: order([InternalStep, pipe([EgressGroups...])])
+        #
+        # For general microservices, modify this section to build
+        # any order/pipe combination needed.
+        # ========================================================
         
-        if len(my_service_graph) > 0:
-            if len(trace)>0:
-                service_error_dict = run_external_service(my_service_graph,globalDict['work_model'],query_string,trace[ID],app, jaeger_headers)
+        ctx = get_current_context()
+        
+        if ctx is not None:
+            graph_steps = []
+            
+            # Step 1: Internal service (in ThreadPool)
+            graph_steps.append(
+                InternalStep(
+                    id="internal_service",
+                    func=_run_internal,
+                    args=(my_internal_service,),
+                )
+            )
+            
+            # Step 2: External services (via SHM Queue)
+            # run_external_service builds egress sub-graph and sets ctx.graph
+            # But we need to integrate it into our graph, so we build it here directly
+            if len(my_service_graph) > 0:
+                trace_data = trace.get(ID, {}) if trace else {}
+                
+                egress_graph = _build_egress_graph(
+                    my_service_graph, globalDict['work_model'], 
+                    query_string, trace_data, jaeger_headers, app
+                )
+                
+                if egress_graph:
+                    graph_steps.append(egress_graph)
+            
+            # Assemble final graph
+            if len(graph_steps) == 1:
+                ctx.graph = graph_steps[0]
             else:
-                service_error_dict = run_external_service(my_service_graph,globalDict['work_model'],query_string,dict(),app, jaeger_headers)
-            if len(service_error_dict):
-                app.logger.error(service_error_dict)
-                app.logger.error("Error in request external services")
-                app.logger.error(service_error_dict)
-                return make_response(json.dumps({"message": "Error in external services request"}), 500)
-        app.logger.info("############### EXTERNAL SERVICES FINISHED! ###############")
+                ctx.graph = order(graph_steps)
+            
+            app.logger.info(f"Execution graph registered with {len(graph_steps)} steps")
+        else:
+            # Fallback: no context (shouldn't happen in graph mode)
+            app.logger.warning("No dpumesh context - running synchronously")
+            body = run_internal_service(my_internal_service)
+            if len(my_service_graph) > 0:
+                trace_data = trace.get(ID, {}) if trace else {}
+                run_external_service(
+                    my_service_graph, globalDict['work_model'],
+                    query_string, trace_data, app, jaeger_headers
+                )
+            response = make_response(body)
+            response.mimetype = "text/plain"
+            response.headers.update(jaeger_headers)
+            return response
 
-        response = make_response(body)
+        # Graph mode: return placeholder (server will replace with actual result)
+        response = make_response("")
         response.mimetype = "text/plain"
-        EXTERNAL_PROCESSING.labels(ZONE, K8S_APP, request.method, request.path).observe((time.time() - start_external_request_processing)*1000)
-        EXTERNAL_PROCESSING_BUCKET.labels(ZONE, K8S_APP, request.method, request.path).observe((time.time() - start_external_request_processing)*1000)
-        
-        REQUEST_PROCESSING.labels(ZONE, K8S_APP, request.method, request.path, request.remote_addr, ID).observe((time.time() - start_request_processing)*1000)
-        REQUEST_PROCESSING_BUCKET.labels(ZONE, K8S_APP, request.method, request.path, request.remote_addr, ID).observe((time.time() - start_request_processing)*1000)
-
-        # Add trace context propagation headers to the response
         response.headers.update(jaeger_headers)
-
         return response
+        
     except Exception as err:
         app.logger.error(f"Error in start_worker: {err}")
-        # app.logger.error(traceback.format_exc())
         return json.dumps({"message": "Error"}), 500
+
+
+def _build_egress_graph(services_group, work_model, query_string, trace, trace_context, app):
+    """Build egress execution graph from service groups.
+    
+    Returns: Order, Pipe, EgressStep, or None
+    """
+    import random
+    
+    groups = []
+    
+    for group_id, group in enumerate(services_group):
+        if group["seq_len"] < len(group["services"]):
+            selected = random.sample(group["services"], k=group["seq_len"])
+        else:
+            selected = list(group["services"])
+        
+        probabilities = group.get("probabilities", {})
+        filtered = []
+        for service in selected:
+            p = probabilities.get(service, 1)
+            if random.random() < p:
+                filtered.append(service)
+        
+        if not filtered:
+            continue
+        
+        steps = []
+        for svc_idx, service in enumerate(filtered):
+            from ExternalServiceExecutor_dpu import _build_request
+            req = _build_request(service, group_id, work_model, query_string, trace, trace_context)
+            step = EgressStep(
+                id=f"egress_g{group_id}_s{svc_idx}_{service}",
+                requests=[req],
+            )
+            steps.append(step)
+        
+        if len(steps) == 1:
+            groups.append(steps[0])
+        else:
+            groups.append(order(steps))
+        
+        app.logger.info(f"[Group {group_id}] {' → '.join(filtered)}")
+    
+    if not groups:
+        return None
+    elif len(groups) == 1:
+        return groups[0]
+    else:
+        return pipe(groups)
+
 
 # Prometheus
 @app.route('/metrics')
@@ -227,27 +308,17 @@ def metrics():
     return Response(prometheus_client.generate_latest(registry), mimetype=CONTENT_TYPE_LATEST)
 
 
-# ===== REMOVED: Gunicorn HttpServer class =====
-# ===== REMOVED: gRPC server (for now) =====
-
-
 if __name__ == '__main__':
     if request_method == "rest":
         init_REST(app)
         
-        # ===== CHANGED: Use ProcessGraphServer for Multi-Process Non-Blocking =====
         from dpumesh.server import ProcessGraphServer
         
-        # Use 'PN' (Process Number) from environment, default to 4 if not set
         num_workers = int(PN) if PN else 4
-        
-        # Pass app path string so workers can load it fresh
         server = ProcessGraphServer("CellController-mp_dpu:app", host='0.0.0.0', port=8080, workers=num_workers)
         server.run()
-        # =========================================================================
         
     elif request_method == "grpc":
-        # gRPC not yet supported in DPU mode
         print("gRPC mode not yet supported with DPUmesh")
         sys.exit(1)
     else:

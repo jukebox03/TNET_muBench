@@ -1,7 +1,13 @@
 """
-dpumesh - DPU Mesh Simulation Library (v3)
+dpumesh - DPU Mesh Simulation Library (v4)
 
-Queue 기반 구현:
+Execution Graph 기반 구현:
+- order([...])  : 순차 실행
+- pipe([...])   : 병렬 실행
+- EgressStep    : 외부 서비스 호출 (SHM Queue, non-blocking)
+- InternalStep  : 내부 함수 실행 (ThreadPool, non-blocking)
+
+Queue 기반 통신:
 - Worker: Queue에 넣고 빼기만
 - DMA Manager: Queue 간 데이터 이동
 - Sidecar: 라우팅 결정 (같은노드=Queue, 다른노드=HTTP)
@@ -37,6 +43,23 @@ from .host_lib import (
     set_shared_state,
 )
 
+from .server import (
+    # Execution Graph
+    Order,
+    Pipe,
+    EgressStep,
+    InternalStep,
+    StepResult,
+    ExecutionContext,
+    order,
+    pipe,
+    get_current_context,
+    # Server
+    ProcessGraphServer,
+    ProcessDPUServer,
+    DPUmeshServer,
+)
+
 # 기존 코드 호환용 alias
 from . import host_lib as dpu_lib
 
@@ -67,4 +90,18 @@ __all__ = [
     'get_shared_state',
     'set_shared_state',
     'dpu_lib',
+    # Execution Graph
+    'Order',
+    'Pipe',
+    'EgressStep',
+    'InternalStep',
+    'StepResult',
+    'ExecutionContext',
+    'order',
+    'pipe',
+    'get_current_context',
+    # Server
+    'ProcessGraphServer',
+    'ProcessDPUServer',
+    'DPUmeshServer',
 ]

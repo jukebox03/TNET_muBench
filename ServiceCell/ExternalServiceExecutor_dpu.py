@@ -1,10 +1,9 @@
 """
-ExternalServiceExecutor - DPUmesh graph version
+ExternalServiceExecutor - DPUmesh Execution Graph version
 
-Role: Build egress_graph and register it on ctx.
-      Server handles all the execution.
-
-That's it. No threads, no callbacks, no submit calls.
+Role: Build execution graph (order/pipe/EgressStep/InternalStep)
+      and register it on ctx.
+      Server handles all execution via event loop.
 
 Original (thread-based):
     ThreadPoolExecutor(N groups)
@@ -12,17 +11,21 @@ Original (thread-based):
       └→ Thread: svc_C(block)
 
 DPUmesh (graph-based):
-    Build graph:
-      Group 0: [(GET, url_A, ...), (GET, url_B, ...)]
-      Group 1: [(GET, url_C, ...)]
-    Register on ctx → return
-    Server drives everything.
+    pipe([
+      order([EgressStep(svc_A), EgressStep(svc_B)]),  # Group 0: sequential
+      order([EgressStep(svc_C)]),                       # Group 1: sequential
+    ])
+    → Groups run in parallel (pipe), services within group run sequentially (order)
 """
 
 import random
 import json
 
-from dpumesh.server import get_current_context, EgressGroup
+from dpumesh.server import (
+    get_current_context,
+    EgressStep, InternalStep, Order, Pipe,
+    order, pipe,
+)
 
 
 def init_REST(app):
@@ -36,7 +39,7 @@ def init_gRPC(my_service_graph, workmodel, server_port, app):
 def _build_request(service, group_id, work_model, query_string, trace, trace_context):
     """Build (method, url, headers, body) for a service call"""
     service_no_escape = service.split("__")[0]
-    url = f'http://{work_model[service_no_escape]["url"]}{work_model[service_no_escape]["path"]}'
+    base_url = f'http://{work_model[service_no_escape]["url"]}{work_model[service_no_escape]["path"]}'
     
     method = "GET"
     headers = trace_context.copy() if trace_context else {}
@@ -48,21 +51,19 @@ def _build_request(service, group_id, work_model, query_string, trace, trace_con
         json_dict = {service: trace[group_id][service]}
         body = json.dumps(json_dict)
         if query_string:
-            url = f"{url}?{query_string}"
+            base_url = f"{base_url}?{query_string}"
     elif query_string:
-        url = f"{url}?{query_string}"
+        base_url = f"{base_url}?{query_string}"
     
-    return (method, url, headers, body)
+    return (method, base_url, headers, body)
 
 
 def run_external_service(services_group, work_model, query_string, trace, app, trace_context=None):
     """
-    Build egress graph and register on ctx. That's all.
+    Build execution graph and register on ctx.
     
-    Server event loop handles:
-    - Submitting first service of each group (parallel)
-    - On response: check graph → send next (sequential within group)
-    - All done → finalize
+    Groups → pipe (parallel)
+    Services within group → order (sequential)
     """
     app.logger.info("** EXTERNAL SERVICES (DPUmesh graph mode)")
     
@@ -74,7 +75,9 @@ def run_external_service(services_group, work_model, query_string, trace, app, t
         app.logger.error("No dpumesh context available")
         return {"error": Exception("No dpumesh context")}
     
-    # Build egress graph
+    # Build groups
+    groups = []
+    
     for group_id, group in enumerate(services_group):
         # Select services based on seq_len
         if group["seq_len"] < len(group["services"]):
@@ -93,18 +96,34 @@ def run_external_service(services_group, work_model, query_string, trace, app, t
         if not filtered:
             continue
         
-        # Build request tuples for this group
-        request_list = []
-        for service in filtered:
+        # Build EgressStep list for this group (sequential within group)
+        steps = []
+        for svc_idx, service in enumerate(filtered):
             req = _build_request(service, group_id, work_model, query_string, trace, trace_context)
-            request_list.append(req)
+            step = EgressStep(
+                id=f"egress_g{group_id}_s{svc_idx}_{service}",
+                requests=[req],
+            )
+            steps.append(step)
         
-        # Register group
-        ctx.egress_graph.append(EgressGroup(requests=request_list))
+        if len(steps) == 1:
+            groups.append(steps[0])
+        else:
+            groups.append(order(steps))
         
         app.logger.info(f"[Group {group_id}] Registered: {' → '.join(filtered)}")
     
-    app.logger.info(f"Registered {len(ctx.egress_graph)} groups on egress graph")
+    # Assemble graph
+    if not groups:
+        app.logger.info("No groups to execute")
+        return {}
+    elif len(groups) == 1:
+        ctx.graph = groups[0]
+    else:
+        # Multiple groups → parallel execution
+        ctx.graph = pipe(groups)
     
-    # No errors at this point - errors are handled by server asynchronously
+    app.logger.info(f"Registered execution graph with {len(groups)} groups")
+    
+    # No errors at this point - errors handled by server asynchronously
     return {}
