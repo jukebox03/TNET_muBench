@@ -4,7 +4,15 @@ dpumesh.server - Execution Graph Server
 Server는 context(= execution graph + 현재 상태)만 보고 이벤트를 전달하는 역할.
 지능은 context에, 실행력은 server에.
 
-Execution Graph 문법:
+High-Level API (권장):
+  ctx = get_context()
+  ctx.run_internal(func, args=(...))     # 내부 함수 실행
+  ctx.call("GET", "http://svc/api")      # 외부 서비스 호출
+  with ctx.parallel():                    # 병렬 실행 블록
+      ctx.call("GET", "http://s1/api")
+      ctx.call("GET", "http://s2/api")
+
+Low-Level API (직접 graph 조립):
   order([...])  - 순차 실행
   pipe([...])   - 병렬 실행
   EgressStep    - 외부 서비스 호출 (SHM Queue, non-blocking)
@@ -196,6 +204,127 @@ class ExecutionContext:
         self._ec_order_current: Dict[str, int] = {}
         self._ec_pipe_children: Dict[str, List[str]] = {}
         self._ec_alias_nodes: Dict[str, str] = {}
+        
+        # High-level builder state
+        self._builder_steps: List[Step] = []   # 순차로 쌓이는 step 리스트
+        self._builder_counter: int = 0          # 자동 ID 카운터
+        self._parallel_ctx: Optional[List[Step]] = None  # parallel 블록 내부 수집용
+    
+    # ==================== High-Level Builder API ====================
+    #
+    # 사용자는 이 API로 graph를 선언적으로 구성.
+    # handler return 후 _build_graph()가 자동 호출되어 low-level graph로 변환.
+    #
+    # 사용법:
+    #   ctx = get_context()
+    #   ctx.run_internal(compute, args=(data,))
+    #   with ctx.parallel():
+    #       ctx.call("POST", "http://s1:80/api/v1", body=payload)
+    #       ctx.call("GET", "http://s2:80/api/v1")
+    #   ctx.run_internal(merge)
+    
+    def run_internal(self, func: Callable, *, 
+                     args: tuple = (), kwargs: dict = None,
+                     inputs: List[str] = None, id: str = None) -> str:
+        """내부 함수 실행 등록.
+        
+        Args:
+            func: 실행할 함수
+            args: 위치 인자
+            kwargs: 키워드 인자
+            inputs: 이전 step 결과 참조 (step_id 리스트)
+            id: step 고유 ID (미지정 시 자동 생성)
+        
+        Returns:
+            step_id: 나중에 inputs로 참조할 수 있는 ID
+        """
+        step_id = id or f"_internal_{self._builder_counter}"
+        self._builder_counter += 1
+        
+        step = InternalStep(
+            id=step_id,
+            func=func,
+            args=args,
+            kwargs=kwargs or {},
+            inputs=inputs or [],
+        )
+        
+        if self._parallel_ctx is not None:
+            self._parallel_ctx.append(step)
+        else:
+            self._builder_steps.append(step)
+        
+        return step_id
+    
+    def call(self, method: str, url: str, *,
+             headers: Dict[str, str] = None, body: str = None,
+             inputs: List[str] = None, request_builder: Callable = None,
+             id: str = None) -> str:
+        """외부 서비스 호출 등록.
+        
+        Args:
+            method: HTTP method ("GET", "POST", ...)
+            url: 대상 URL
+            headers: HTTP 헤더
+            body: 요청 body
+            inputs: 이전 step 결과 참조 (step_id 리스트)
+            request_builder: 동적 request 빌드 함수 (inputs 결과를 받아 requests 리스트 반환)
+            id: step 고유 ID (미지정 시 자동 생성)
+        
+        Returns:
+            step_id: 나중에 inputs로 참조할 수 있는 ID
+        """
+        step_id = id or f"_egress_{self._builder_counter}"
+        self._builder_counter += 1
+        
+        if request_builder:
+            step = EgressStep(
+                id=step_id,
+                request_builder=request_builder,
+                inputs=inputs or [],
+            )
+        else:
+            step = EgressStep(
+                id=step_id,
+                requests=[(method, url, headers or {}, body)],
+                inputs=inputs or [],
+            )
+        
+        if self._parallel_ctx is not None:
+            self._parallel_ctx.append(step)
+        else:
+            self._builder_steps.append(step)
+        
+        return step_id
+    
+    def parallel(self):
+        """병렬 실행 블록 (context manager).
+        
+        with ctx.parallel():
+            ctx.call("GET", "http://s1/api")
+            ctx.call("GET", "http://s2/api")
+        
+        블록 안의 모든 step이 동시에 실행됨.
+        """
+        return _ParallelBlock(self)
+    
+    def _build_graph(self):
+        """Builder API로 등록된 step들을 low-level graph로 변환.
+        
+        Server가 _process_wsgi_app() 후 자동 호출.
+        이미 self.graph가 직접 설정된 경우 (low-level API) 건드리지 않음.
+        """
+        if self.graph is not None:
+            # low-level API로 직접 설정됨 → 그대로 사용
+            return
+        
+        if not self._builder_steps:
+            return
+        
+        if len(self._builder_steps) == 1:
+            self.graph = self._builder_steps[0]
+        else:
+            self.graph = Order(self._builder_steps)
     
     def start(self) -> List[Action]:
         """Graph 실행 시작 - 초기 Action 리스트 반환"""
@@ -533,6 +662,42 @@ class ExecutionContext:
     # are initialized in __init__ as _ec_* attributes
 
 
+class _ParallelBlock:
+    """Context manager for parallel execution blocks.
+    
+    with ctx.parallel():
+        ctx.call(...)   # 이 블록 안의 step들은 Pipe로 묶임
+        ctx.call(...)
+    """
+    
+    def __init__(self, ctx: ExecutionContext):
+        self._ctx = ctx
+    
+    def __enter__(self):
+        if self._ctx._parallel_ctx is not None:
+            raise RuntimeError("parallel() 블록은 중첩할 수 없습니다. 대신 low-level API (pipe/order)를 사용하세요.")
+        self._ctx._parallel_ctx = []
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        steps = self._ctx._parallel_ctx
+        self._ctx._parallel_ctx = None
+        
+        if exc_type is not None:
+            return False  # 예외 전파
+        
+        if not steps:
+            return False
+        
+        if len(steps) == 1:
+            # 하나뿐이면 그냥 순차에 추가
+            self._ctx._builder_steps.append(steps[0])
+        else:
+            self._ctx._builder_steps.append(Pipe(steps))
+        
+        return False
+
+
 # ========================================================================================
 # 3. HELPER: APP LOADER
 # ========================================================================================
@@ -685,6 +850,9 @@ class DPUmeshServer:
         
         # WSGI 앱 실행 (Flask handler → graph 등록)
         self._process_wsgi_app(ctx)
+        
+        # High-level builder API로 등록된 step들을 graph로 변환
+        ctx._build_graph()
         
         # Graph 실행 시작
         actions = ctx.start()
@@ -866,6 +1034,9 @@ def _clear_current_context():
 
 def get_current_context() -> Optional[ExecutionContext]:
     return getattr(_context_local, 'current_ctx', None)
+
+# Alias: 간결한 이름
+get_context = get_current_context
 
 def set_server(s):
     _context_local.server = s

@@ -1,30 +1,19 @@
 from __future__ import print_function
 
-import argparse
 import json
 import os
 import sys
 import time
 import traceback
-from threading import Thread
-from concurrent import futures
 
 from flask import Flask, Response, json, make_response, request
 import prometheus_client
 from prometheus_client import CollectorRegistry, Summary, multiprocess, Histogram
 
-from ExternalServiceExecutor_dpu import init_REST, init_gRPC, run_external_service
+from ExternalServiceExecutor_dpu import init_REST, register_external_calls
 from InternalServiceExecutor import run_internal_service
 
-from dpumesh.server import (
-    get_current_context,
-    EgressStep, InternalStep, Order, Pipe,
-    order, pipe,
-)
-
-import mub_pb2_grpc as pb2_grpc
-import mub_pb2 as pb2
-import grpc
+from dpumesh.server import get_context
 
 
 # Configuration of global variables
@@ -51,7 +40,6 @@ ID = os.environ["APP"]
 ZONE = os.environ["ZONE"]  # Pod Zone
 K8S_APP = os.environ["K8S_APP"]  # K8s label app
 PN = os.environ.get("PN", "4")  # Number of processes
-TN = os.environ.get("TN", "16")  # Number of thread per process
 traceEscapeString = "__"
 
 globalDict=dict()
@@ -181,67 +169,42 @@ def start_worker():
                         my_service_graph = my_work_model['alternative_behaviors'][behaviour_id]['external_services']
 
         # ========================================================
-        # Build Execution Graph
+        # Build Execution Graph (High-Level API)
         # ========================================================
-        # 
-        # μBench pattern: Internal first, then External
-        # Graph: order([InternalStep, pipe([EgressGroups...])])
         #
-        # For general microservices, modify this section to build
-        # any order/pipe combination needed.
+        # μBench pattern: Internal first, then External (parallel)
+        #
+        # 생성되는 graph:
+        #   order([
+        #     InternalStep("internal_service"),
+        #     pipe([
+        #       call("POST", "http://s1/api/v1"),
+        #       call("POST", "http://s2/api/v1"),
+        #     ])
+        #   ])
         # ========================================================
         
-        ctx = get_current_context()
+        ctx = get_context()
         
         if ctx is not None:
-            graph_steps = []
+            trace_data = trace.get(ID, {}) if trace else {}
             
-            # Step 1: Internal service (in ThreadPool)
-            graph_steps.append(
-                InternalStep(
-                    id="internal_service",
-                    func=_run_internal,
-                    args=(my_internal_service,),
-                )
-            )
+            # Step 1: Internal service (ThreadPool에서 실행)
+            ctx.run_internal(_run_internal, args=(my_internal_service,), id="internal_service")
             
-            # Step 2: External services (via SHM Queue)
-            # run_external_service builds egress sub-graph and sets ctx.graph
-            # But we need to integrate it into our graph, so we build it here directly
+            # Step 2: External services (SHM Queue, 병렬)
             if len(my_service_graph) > 0:
-                trace_data = trace.get(ID, {}) if trace else {}
-                
-                egress_graph = _build_egress_graph(
-                    my_service_graph, globalDict['work_model'], 
-                    query_string, trace_data, jaeger_headers, app
-                )
-                
-                if egress_graph:
-                    graph_steps.append(egress_graph)
+                with ctx.parallel():
+                    register_external_calls(
+                        ctx, my_service_graph, globalDict['work_model'],
+                        query_string, trace_data, app, jaeger_headers
+                    )
             
-            # Assemble final graph
-            if len(graph_steps) == 1:
-                ctx.graph = graph_steps[0]
-            else:
-                ctx.graph = order(graph_steps)
-            
-            app.logger.info(f"Execution graph registered with {len(graph_steps)} steps")
+            app.logger.info("Execution graph registered")
         else:
-            # Fallback: no context (shouldn't happen in graph mode)
             app.logger.warning("No dpumesh context - running synchronously")
-            body = run_internal_service(my_internal_service)
-            if len(my_service_graph) > 0:
-                trace_data = trace.get(ID, {}) if trace else {}
-                run_external_service(
-                    my_service_graph, globalDict['work_model'],
-                    query_string, trace_data, app, jaeger_headers
-                )
-            response = make_response(body)
-            response.mimetype = "text/plain"
-            response.headers.update(jaeger_headers)
-            return response
 
-        # Graph mode: return placeholder (server will replace with actual result)
+        # Graph mode: 빈 응답 return (Server가 graph 실행 후 최종 결과로 교체)
         response = make_response("")
         response.mimetype = "text/plain"
         response.headers.update(jaeger_headers)
@@ -250,56 +213,6 @@ def start_worker():
     except Exception as err:
         app.logger.error(f"Error in start_worker: {err}")
         return json.dumps({"message": "Error"}), 500
-
-
-def _build_egress_graph(services_group, work_model, query_string, trace, trace_context, app):
-    """Build egress execution graph from service groups.
-    
-    Returns: Order, Pipe, EgressStep, or None
-    """
-    import random
-    
-    groups = []
-    
-    for group_id, group in enumerate(services_group):
-        if group["seq_len"] < len(group["services"]):
-            selected = random.sample(group["services"], k=group["seq_len"])
-        else:
-            selected = list(group["services"])
-        
-        probabilities = group.get("probabilities", {})
-        filtered = []
-        for service in selected:
-            p = probabilities.get(service, 1)
-            if random.random() < p:
-                filtered.append(service)
-        
-        if not filtered:
-            continue
-        
-        steps = []
-        for svc_idx, service in enumerate(filtered):
-            from ExternalServiceExecutor_dpu import _build_request
-            req = _build_request(service, group_id, work_model, query_string, trace, trace_context)
-            step = EgressStep(
-                id=f"egress_g{group_id}_s{svc_idx}_{service}",
-                requests=[req],
-            )
-            steps.append(step)
-        
-        if len(steps) == 1:
-            groups.append(steps[0])
-        else:
-            groups.append(order(steps))
-        
-        app.logger.info(f"[Group {group_id}] {' → '.join(filtered)}")
-    
-    if not groups:
-        return None
-    elif len(groups) == 1:
-        return groups[0]
-    else:
-        return pipe(groups)
 
 
 # Prometheus
