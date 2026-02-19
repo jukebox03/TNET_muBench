@@ -56,7 +56,6 @@ from .server import (
     get_current_context,
     # Server
     ProcessGraphServer,
-    ProcessDPUServer,
     DPUmeshServer,
 )
 
@@ -102,6 +101,5 @@ __all__ = [
     'get_current_context',
     # Server
     'ProcessGraphServer',
-    'ProcessDPUServer',
     'DPUmeshServer',
 ]

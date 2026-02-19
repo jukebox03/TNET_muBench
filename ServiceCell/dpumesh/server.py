@@ -562,29 +562,6 @@ def load_app_from_path(path):
 # 4. WORKER PROCESS TARGETS
 # ========================================================================================
 
-def _run_blocking_worker(idx, queue, shared_state, app_path, host, port):
-    """Blocking Mode Worker - polling 스레드 사용"""
-    try:
-        wid = f"block-{idx}-{os.getpid()}"
-        dlib.init_worker(wid, start_poller=True)
-        
-        app = load_app_from_path(app_path)
-        print(f"[Worker-{idx}] Ready (Blocking Mode)", flush=True)
-        
-        while True:
-            req = dlib.poll_ingress_sq()
-            if not req:
-                dlib.wait_interrupt()
-                continue
-            
-            _handle_wsgi(app, req, host, port)
-            
-    except KeyboardInterrupt: pass
-    except Exception as e:
-        print(f"[Worker-{idx}] Crash: {e}")
-        traceback.print_exc()
-
-
 def _run_graph_worker(idx, queue, shared_state, app_path, host, port):
     """Graph Mode Worker - SHM 직접 읽기"""
     try:
@@ -605,84 +582,9 @@ def _run_graph_worker(idx, queue, shared_state, app_path, host, port):
         traceback.print_exc()
 
 
-def _handle_wsgi(app, req, host, port):
-    """Common WSGI handler for blocking mode"""
-    from .common import IngressResponse
-    try:
-        environ = {
-            'REQUEST_METHOD': req.method,
-            'PATH_INFO': req.path,
-            'QUERY_STRING': req.query_string,
-            'SERVER_PROTOCOL': 'HTTP/1.1',
-            'REMOTE_ADDR': req.remote_addr,
-            'SERVER_NAME': host,
-            'SERVER_PORT': str(port),
-            'wsgi.input': BytesIO(req.body.encode() if req.body else b''),
-            'wsgi.errors': sys.stderr,
-            'CONTENT_LENGTH': str(len(req.body.encode() if req.body else b'')),
-            'CONTENT_TYPE': req.headers.get('Content-Type', ''),
-            'wsgi.multithread': False,
-            'wsgi.multiprocess': True,
-            'wsgi.run_once': False,
-            'wsgi.url_scheme': 'http',
-        }
-        for k, v in req.headers.items():
-            k_u = k.upper().replace('-', '_')
-            if k_u not in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
-                environ[f'HTTP_{k_u}'] = v
-
-        status_code = 200
-        headers = {}
-        def start_response(status, response_headers, exc_info=None):
-            nonlocal status_code, headers
-            status_code = int(status.split()[0])
-            headers = dict(response_headers)
-
-        result = app(environ, start_response)
-        body = ''.join([c.decode('utf-8') if isinstance(c, bytes) else str(c) for c in result])
-        
-        source = dlib.get_worker_id()
-        dest = getattr(req, 'source_worker', '') or ''
-        
-        dlib.write_ingress_cq(
-            IngressResponse(req.req_id, status_code, headers, body),
-            source_worker=source,
-            dest_worker=dest
-        )
-        
-    except Exception as e:
-        print(f"[WSGI] Error: {e}")
-        traceback.print_exc()
-
-
 # ========================================================================================
 # 5. SERVER CLASSES (Multi-Process Launchers)
 # ========================================================================================
-
-class ProcessDPUServer:
-    """Multi-Process Server for BLOCKING applications"""
-    def __init__(self, app_path, host, port, workers):
-        self.app_path = app_path
-        self.host = host
-        self.port = port
-        self.workers = workers
-        
-    def run(self):
-        manager = multiprocessing.Manager()
-        queues = [manager.Queue() for _ in range(self.workers)]
-        
-        procs = []
-        for i in range(self.workers):
-            p = multiprocessing.Process(
-                target=_run_blocking_worker,
-                args=(i, queues[i], None, self.app_path, self.host, self.port)
-            )
-            p.start()
-            procs.append(p)
-            
-        print(f"[Server] Started {self.workers} BLOCKING workers.")
-        for p in procs: p.join()
-
 
 class ProcessGraphServer:
     """Multi-Process Server for NON-BLOCKING (Graph) applications"""
@@ -978,12 +880,8 @@ def main():
     host = os.environ.get('DPUMESH_HOST', '0.0.0.0')
     port = int(os.environ.get('DPUMESH_PORT', '8080'))
     workers = int(os.environ.get('DPUMESH_WORKERS', '50'))
-    mode = os.environ.get('DPUMESH_MODE', 'graph').lower()
     
-    if mode == 'blocking':
-        server = ProcessDPUServer(app_path, host, port, workers)
-    else:
-        server = ProcessGraphServer(app_path, host, port, workers)
+    server = ProcessGraphServer(app_path, host, port, workers)
     
     try:
         server.run()
